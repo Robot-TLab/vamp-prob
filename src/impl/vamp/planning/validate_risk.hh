@@ -81,7 +81,7 @@ namespace vamp::planning
     template <typename Robot, std::size_t rake>
     inline auto block_risk(
         const typename Robot::template ConfigurationBlock<rake> &block,
-        const collision::Environment<FloatVector<rake>> &env,
+        const collision::Environment<float> &env,
         const FloatVector<rake, Robot::n_sigma_q> &sigma_q_block) noexcept -> std::array<float, rake>
     {
         typename Robot::template SpheresWithCov<rake> spheres;
@@ -123,7 +123,7 @@ namespace vamp::planning
     template <typename Robot, std::size_t rake>
     inline auto validate_config_risk(
         const typename Robot::Configuration &q,
-        const collision::Environment<FloatVector<rake>> &env,
+        const collision::Environment<float> &env,
         const collision::Sym3 &sigma_q) noexcept -> float
     {
         // Build a rake block with every lane = q (cheap; only one lane
@@ -153,7 +153,7 @@ namespace vamp::planning
     inline auto validate_motion_risk(
         const typename Robot::Configuration &start,
         const typename Robot::Configuration &goal,
-        const collision::Environment<FloatVector<rake>> &env,
+        const collision::Environment<float> &env,
         const collision::Sym3 &sigma_q,
         float eps_per_waypoint = std::numeric_limits<float>::infinity()) -> EdgeRiskResult
     {

@@ -44,9 +44,14 @@ namespace vamp
     //                  from the cricket-emitted SpheresWithCov<rake>.
     //                  Pass ``sym3_iso(r_s * r_s)`` for the stopped-
     //                  base degenerate case (no uncertainty).
-    template <typename DataT>
+    // Iterates the *scalar* float environment.  Obstacle fields
+    // (min_distance, three_sigma_extent, mean, covariance) are scalar
+    // floats — every per-sphere per-lane evaluation is a scalar
+    // Gaussian product.  SIMD vectorisation in the planner happens
+    // across rake lanes inside ``validate_motion_risk``; this inner
+    // loop runs scalar so the comparison + cull logic stays simple.
     inline auto sphere_environment_risk(
-        const collision::Environment<DataT> &e,
+        const collision::Environment<float> &e,
         float cs_x,
         float cs_y,
         float cs_z,
@@ -63,7 +68,7 @@ namespace vamp
             // extent).  Once an obstacle's ``min_distance`` exceeds the
             // sphere's reach, every subsequent obstacle is even farther
             // and contributes negligibly.
-            if (static_cast<float>(g.min_distance) > centre_extent + static_cast<float>(g.three_sigma_extent))
+            if (g.min_distance > centre_extent + g.three_sigma_extent)
             {
                 break;
             }
