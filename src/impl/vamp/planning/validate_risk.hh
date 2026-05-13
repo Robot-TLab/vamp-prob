@@ -133,7 +133,7 @@ namespace vamp::planning
         typename Robot::template ConfigurationBlock<rake> block;
         for (auto i = 0U; i < Robot::dimension; ++i)
         {
-            block[i] = FloatVector<rake, 1>::fill(q.broadcast(i)[0]);
+            block[i] = q.broadcast(i);
         }
 
         const auto sigma_q_block = broadcast_sigma_q<rake, Robot::n_sigma_q>(sigma_q);
