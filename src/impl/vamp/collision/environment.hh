@@ -22,6 +22,14 @@ namespace vamp::collision
         std::vector<Cuboid<DataT>> z_aligned_cuboids;
         std::vector<HeightField<DataT>> heightfields;
         std::vector<CAPT> pointclouds;
+        // Probabilistic-CC obstacle population — tracked dynamic
+        // obstacles or unknown-region risk kernels.  Iterated by the
+        // risk evaluator in ``collision/risk_validity.hh`` alongside
+        // ``pointclouds`` (which serves as the static-map Dirac
+        // population for the same evaluator).  Sorted by
+        // ``min_distance`` so the same early-exit cull pattern as
+        // the geometric shapes applies.
+        std::vector<GaussianObstacle<DataT>> gaussian_obstacles;
         std::optional<Attachment<DataT>> attachments;
 
         Environment() = default;
@@ -36,6 +44,7 @@ namespace vamp::collision
           , z_aligned_cuboids(other.z_aligned_cuboids.begin(), other.z_aligned_cuboids.end())
           , heightfields(other.heightfields.begin(), other.heightfields.end())
           , pointclouds(other.pointclouds.begin(), other.pointclouds.end())
+          , gaussian_obstacles(other.gaussian_obstacles.begin(), other.gaussian_obstacles.end())
           , attachments(other.template clone_attachments<DataT>())
         {
         }
@@ -65,6 +74,10 @@ namespace vamp::collision
             std::sort(
                 z_aligned_cuboids.begin(),
                 z_aligned_cuboids.end(),
+                [](const auto &a, const auto &b) { return a.min_distance < b.min_distance; });
+            std::sort(
+                gaussian_obstacles.begin(),
+                gaussian_obstacles.end(),
                 [](const auto &a, const auto &b) { return a.min_distance < b.min_distance; });
         }
 
