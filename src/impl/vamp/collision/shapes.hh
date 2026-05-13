@@ -245,6 +245,110 @@ namespace vamp::collision
         }
     };
 
+    // A Gaussian obstacle, used by the probabilistic collision-checking
+    // pipeline.  Represents an obstacle whose pose is uncertain (e.g. a
+    // tracked dynamic obstacle from a Kalman filter, or an unknown-region
+    // risk kernel) as a 3D Gaussian: center (mx, my, mz), symmetric 3x3
+    // covariance ``sigma_{xx,xy,xz,yy,yz,zz}``, and an occupancy weight
+    // ``alpha`` (the body-kernel volume α_h from eq:obstacle_psv_approx).
+    //
+    // ``min_distance`` is the conservative Euclidean lower bound on the
+    // mean's distance from the world origin, minus a 3σ margin along
+    // the covariance's largest axis.  It enables the same early-exit
+    // sort + cull pattern the deterministic shapes use in ``validity.hh``.
+    //
+    // Per-sphere collision risk against a Gaussian obstacle is one
+    // call to ``vamp::collision::gaussian3_density`` (see
+    // ``collision/sphere_gaussian.hh``).
+    template <typename DataT>
+    struct GaussianObstacle : public Shape<DataT>
+    {
+        DataT mx;
+        DataT my;
+        DataT mz;
+
+        // Symmetric covariance — upper triangle, row-major.
+        DataT sigma_xx;
+        DataT sigma_xy;
+        DataT sigma_xz;
+        DataT sigma_yy;
+        DataT sigma_yz;
+        DataT sigma_zz;
+
+        // Occupancy weight (body-kernel mass).  Defaults to 1.
+        DataT alpha;
+
+        // 3σ along the largest axis (computed once at construction).
+        // Used to derive ``min_distance`` for the sort/cull pass and
+        // available to the risk evaluator for Mahalanobis-style early
+        // rejection (sphere centres farther than 3σ from the mean
+        // contribute negligibly to the Gaussian sum).
+        DataT three_sigma_extent;
+
+        inline constexpr auto compute_extent() noexcept -> DataT
+        {
+            // Upper-bound the largest eigenvalue by the matrix's
+            // operator-norm bound: σ_max ≤ sqrt(trace).  This is loose
+            // (always overestimates) but cheap and avoids an eigen
+            // decomposition at construction time — perfect for the
+            // conservative cull use case.
+            const auto trace = sigma_xx + sigma_yy + sigma_zz;
+            return 3.F * vamp::collision::sqrt(trace);
+        }
+
+        inline constexpr auto compute_min_distance() noexcept -> DataT
+        {
+            const auto d = vamp::collision::sqrt(mx * mx + my * my + mz * mz);
+            return d - three_sigma_extent;
+        }
+
+        GaussianObstacle() = default;
+
+        explicit GaussianObstacle(
+            DataT mx,
+            DataT my,
+            DataT mz,  //
+            DataT sigma_xx,
+            DataT sigma_xy,
+            DataT sigma_xz,  //
+            DataT sigma_yy,
+            DataT sigma_yz,  //
+            DataT sigma_zz,
+            DataT alpha = static_cast<DataT>(1.F))
+          : Shape<DataT>()
+          , mx(mx)
+          , my(my)
+          , mz(mz)
+          , sigma_xx(sigma_xx)
+          , sigma_xy(sigma_xy)
+          , sigma_xz(sigma_xz)
+          , sigma_yy(sigma_yy)
+          , sigma_yz(sigma_yz)
+          , sigma_zz(sigma_zz)
+          , alpha(alpha)
+        {
+            three_sigma_extent = compute_extent();
+            Shape<DataT>::min_distance = compute_min_distance();
+        }
+
+        template <typename OtherDataT>
+        explicit GaussianObstacle(const GaussianObstacle<OtherDataT> &other)
+          : Shape<DataT>(other)
+          , mx(other.mx)
+          , my(other.my)
+          , mz(other.mz)
+          , sigma_xx(other.sigma_xx)
+          , sigma_xy(other.sigma_xy)
+          , sigma_xz(other.sigma_xz)
+          , sigma_yy(other.sigma_yy)
+          , sigma_yz(other.sigma_yz)
+          , sigma_zz(other.sigma_zz)
+          , alpha(other.alpha)
+          , three_sigma_extent(other.three_sigma_extent)
+        {
+        }
+    };
+
     // A heighfield. Defined by height pixel buffer.
     template <typename DataT>
     struct HeightField : public Shape<DataT>
