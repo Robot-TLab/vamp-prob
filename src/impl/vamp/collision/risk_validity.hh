@@ -17,13 +17,12 @@
 //     small body-only covariance, or (b) wait for the follow-up
 //     that adds a const-iterator accessor to ``CAPT``.
 //
-// The edge-level driver ``validate_motion_risk<Robot, rake, resolution>``
-// is **not** in this header.  It depends on the cricket-emitted
-// ``sphere_fk_jacobian`` + ``SpheresJac<rake>`` struct, which lives
-// in the robot codegen and is not yet shipped on the cricket_prob
-// branch.  Once that lands, the driver wraps the per-sphere call
-// below across K interpolated waypoints; see the prob extension plan
-// for the staging.
+// The caller (typically the edge driver in
+// ``planning/validate_risk.hh``) supplies the per-sphere covariance
+// ``Σ_r^s`` already assembled — this matches the cricket-emitted
+// ``sphere_fk_with_cov`` output, where ``Σ_r^s = J_s Σ_q J_s^T +
+// r_s²·I`` is computed inside the FK codegen and arrives in
+// ``SpheresWithCov<rake>`` alongside the centre.
 
 #include <vamp/collision/environment.hh>
 #include <vamp/collision/gaussian.hh>
@@ -39,16 +38,12 @@ namespace vamp
     // across spheres to obtain the per-waypoint risk.
     //
     //   c_s            sphere centre in world frame
-    //   r_s            sphere radius (body kernel)
-    //   sigma_b_part   J_s Σ_b J_s^T contribution from base uncertainty,
-    //                  computed by the caller from the cricket-emitted
-    //                  per-sphere base Jacobian and the planar-base
-    //                  covariance.  Pass ``sym3_zero()`` for the
-    //                  stopped-base degenerate case (deterministic).
-    //
-    // The final per-sphere covariance is assembled here as
-    //   Σ_r^s = sigma_b_part + r_s² * I
-    // matching eq:sphere_psv.
+    //   r_s            sphere radius (used only for the cull radius)
+    //   sigma_rs       fully-assembled per-sphere covariance Σ_r^s =
+    //                  J_s · Σ_q · J_s^T + r_s²·I.  Comes directly
+    //                  from the cricket-emitted SpheresWithCov<rake>.
+    //                  Pass ``sym3_iso(r_s * r_s)`` for the stopped-
+    //                  base degenerate case (no uncertainty).
     template <typename DataT>
     inline auto sphere_environment_risk(
         const collision::Environment<DataT> &e,
@@ -56,10 +51,8 @@ namespace vamp
         float cs_y,
         float cs_z,
         float r_s,
-        const collision::Sym3 &sigma_b_part) noexcept -> float
+        const collision::Sym3 &sigma_rs) noexcept -> float
     {
-        const auto sigma_rs = collision::sym3_add(sigma_b_part, collision::sym3_iso(r_s * r_s));
-
         const auto centre_extent = collision::sqrt(cs_x * cs_x + cs_y * cs_y + cs_z * cs_z) + r_s;
 
         float risk = 0.F;
