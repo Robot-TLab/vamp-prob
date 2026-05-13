@@ -96,6 +96,59 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         .def_ro("min_distance", &vc::Cuboid<float>::min_distance)
         .def_rw("name", &vc::Cuboid<float>::name);
 
+    // 3D Gaussian obstacle for probabilistic collision checking.  Mean
+    // (mx, my, mz), symmetric covariance laid out as upper triangle
+    // (sigma_xx, sigma_xy, sigma_xz, sigma_yy, sigma_yz, sigma_zz),
+    // and an occupancy weight alpha (defaults to 1.0).
+    nb::class_<vc::GaussianObstacle<float>>(pymodule, "GaussianObstacle")
+        .def(
+            "__init__",
+            [](vc::GaussianObstacle<float> *q,
+               const std::array<float, 3> &mean,
+               const std::array<float, 6> &sigma_upper,
+               float alpha) noexcept
+            {
+                new (q) vc::GaussianObstacle<float>(
+                    mean[0],
+                    mean[1],
+                    mean[2],
+                    sigma_upper[0],
+                    sigma_upper[1],
+                    sigma_upper[2],
+                    sigma_upper[3],
+                    sigma_upper[4],
+                    sigma_upper[5],
+                    alpha);
+            },
+            "mean"_a,
+            "sigma_upper"_a,
+            "alpha"_a = 1.0F,
+            "Constructor: mean (xyz), covariance upper triangle "
+            "(xx, xy, xz, yy, yz, zz), occupancy weight alpha.")
+        .def_ro("mx", &vc::GaussianObstacle<float>::mx)
+        .def_ro("my", &vc::GaussianObstacle<float>::my)
+        .def_ro("mz", &vc::GaussianObstacle<float>::mz)
+        .def_ro("sigma_xx", &vc::GaussianObstacle<float>::sigma_xx)
+        .def_ro("sigma_xy", &vc::GaussianObstacle<float>::sigma_xy)
+        .def_ro("sigma_xz", &vc::GaussianObstacle<float>::sigma_xz)
+        .def_ro("sigma_yy", &vc::GaussianObstacle<float>::sigma_yy)
+        .def_ro("sigma_yz", &vc::GaussianObstacle<float>::sigma_yz)
+        .def_ro("sigma_zz", &vc::GaussianObstacle<float>::sigma_zz)
+        .def_ro("alpha", &vc::GaussianObstacle<float>::alpha)
+        .def_ro("three_sigma_extent", &vc::GaussianObstacle<float>::three_sigma_extent)
+        .def_prop_ro(
+            "mean",
+            [](vc::GaussianObstacle<float> &g)
+            { return std::array<float, 3>{g.mx, g.my, g.mz}; })
+        .def_prop_ro(
+            "sigma_upper",
+            [](vc::GaussianObstacle<float> &g) {
+                return std::array<float, 6>{
+                    g.sigma_xx, g.sigma_xy, g.sigma_xz, g.sigma_yy, g.sigma_yz, g.sigma_zz};
+            })
+        .def_ro("min_distance", &vc::GaussianObstacle<float>::min_distance)
+        .def_rw("name", &vc::GaussianObstacle<float>::name);
+
     pymodule.def("make_heightfield", &vf::heightfield::array);
 
     nb::class_<vc::HeightField<float>>(pymodule, "HeightField")
@@ -149,6 +202,13 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             [](vc::Environment<float> &e, const vc::HeightField<float> &s)
             { e.heightfields.emplace_back(s); })
         .def(
+            "add_gaussian_obstacle",
+            [](vc::Environment<float> &e, const vc::GaussianObstacle<float> &g)
+            {
+                e.gaussian_obstacles.emplace_back(g);
+                e.sort();
+            })
+        .def(
             "add_pointcloud",
             [](vc::Environment<float> &e,
                const std::vector<collision::Point> &pc,
@@ -170,7 +230,8 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         .def_ro("capsules", &vc::Environment<float>::capsules)
         .def_ro("z_aligned_capsules", &vc::Environment<float>::z_aligned_capsules)
         .def_ro("heightfields", &vc::Environment<float>::heightfields)
-        .def_ro("pointclouds", &vc::Environment<float>::pointclouds);
+        .def_ro("pointclouds", &vc::Environment<float>::pointclouds)
+        .def_ro("gaussian_obstacles", &vc::Environment<float>::gaussian_obstacles);
 
     pymodule.def(
         "filter_pointcloud",
