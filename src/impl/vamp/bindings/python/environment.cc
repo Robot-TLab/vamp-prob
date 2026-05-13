@@ -4,7 +4,9 @@
 #include <vamp/collision/filter.hh>
 #include <vamp/collision/capt.hh>
 #include <vamp/collision/factory.hh>
+#include <vamp/collision/gaussian.hh>
 #include <vamp/collision/shapes.hh>
+#include <vamp/collision/visibility.hh>
 
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/pair.h>
@@ -264,6 +266,70 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
                 vc::filter_pointcloud(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
         });
+
+    // ── Probabilistic CC + visibility math primitives ─────────────────
+    // Robot-agnostic free functions that consumers can call directly to
+    // evaluate the per-sphere Gaussian terms, the observation-cone
+    // integral, or the optimal-gaze line search — without going through
+    // a planner instance.
+
+    pymodule.def(
+        "gaussian3_density",
+        [](const std::array<float, 3> &mean,
+           const std::array<float, 6> &sigma_upper) -> float
+        {
+            const auto sigma = vc::Sym3{
+                sigma_upper[0], sigma_upper[1], sigma_upper[2],
+                sigma_upper[3], sigma_upper[4], sigma_upper[5]};
+            return vc::gaussian3_density(mean[0], mean[1], mean[2], sigma);
+        },
+        "mean"_a, "sigma_upper"_a,
+        "Evaluate N(mean; 0, sigma) for a 3D Gaussian with symmetric "
+        "covariance given as upper-triangle row-major "
+        "(xx, xy, xz, yy, yz, zz).");
+
+    pymodule.def(
+        "observation_reward",
+        [](float qx, float qy, float phi,
+           float sigma_rho, float d_max, float psi,
+           const std::vector<std::array<float, 4>> &kernels) -> float
+        {
+            std::vector<vc::RiskKernel> kv;
+            kv.reserve(kernels.size());
+            for (const auto &k : kernels)
+            {
+                kv.push_back(vc::RiskKernel{k[0], k[1], k[2], k[3]});
+            }
+            return vc::observation_reward(qx, qy, phi, sigma_rho, d_max, psi,
+                                          kv.data(), kv.size());
+        },
+        "qx"_a, "qy"_a, "phi"_a, "sigma_rho"_a, "d_max"_a, "psi"_a,
+        "kernels"_a,
+        "Camera-cone observation reward O(q, phi) for a sensor at "
+        "(qx, qy) with gaze ``phi`` evaluating a list of risk kernels "
+        "[x, y, z, weight].");
+
+    pymodule.def(
+        "optimal_gaze",
+        [](float qx, float qy, float theta,
+           float sigma_rho, float d_max, float psi, float psi_h,
+           const std::vector<std::array<float, 4>> &kernels,
+           int n_iter) -> std::pair<float, float>
+        {
+            std::vector<vc::RiskKernel> kv;
+            kv.reserve(kernels.size());
+            for (const auto &k : kernels)
+            {
+                kv.push_back(vc::RiskKernel{k[0], k[1], k[2], k[3]});
+            }
+            return vc::optimal_gaze(qx, qy, theta, sigma_rho, d_max, psi, psi_h,
+                                    kv.data(), kv.size(), n_iter);
+        },
+        "qx"_a, "qy"_a, "theta"_a, "sigma_rho"_a, "d_max"_a, "psi"_a,
+        "psi_h"_a, "kernels"_a, "n_iter"_a = 20,
+        "Bounded golden-section search for the optimal gaze direction "
+        "phi* over the head-sweep range [theta - psi_h/2, theta + psi_h/2]. "
+        "Returns (phi_star, O_star).");
 
     nb::class_<vc::Attachment<float>>(pymodule, "Attachment")
         .def(

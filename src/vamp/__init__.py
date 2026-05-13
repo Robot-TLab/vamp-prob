@@ -19,6 +19,9 @@ __all__ = [
     "SimplifySettings",
     "SimplifyRoutine",
     "filter_pointcloud",
+    "gaussian3_density",
+    "observation_reward",
+    "optimal_gaze",
     ]
 
 from pathlib import Path
@@ -45,6 +48,9 @@ from ._core import AORRTCSettings as AORRTCSettings
 from ._core import SimplifyRoutine as SimplifyRoutine
 from ._core import SimplifySettings as SimplifySettings
 from ._core import filter_pointcloud as filter_pointcloud
+from ._core import gaussian3_density as gaussian3_density
+from ._core import observation_reward as observation_reward
+from ._core import optimal_gaze as optimal_gaze
 
 robots = _core.robots()
 
