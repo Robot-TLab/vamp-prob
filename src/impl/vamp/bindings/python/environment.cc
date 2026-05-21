@@ -10,6 +10,7 @@
 
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/eigen/dense.h>
@@ -98,11 +99,72 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         .def_ro("min_distance", &vc::Cuboid<float>::min_distance)
         .def_rw("name", &vc::Cuboid<float>::name);
 
-    // 3D Gaussian obstacle for probabilistic collision checking.  Mean
+    // 3-D Gaussian distribution: the primary type vamp uses for every
+    // primitive that integrates over a Gaussian (sphere-vs-Gaussian
+    // collision risk, visibility / observation reward, ...).  Mean
     // (mx, my, mz), symmetric covariance laid out as upper triangle
     // (sigma_xx, sigma_xy, sigma_xz, sigma_yy, sigma_yz, sigma_zz),
-    // and an occupancy weight alpha (defaults to 1.0).
-    nb::class_<vc::GaussianObstacle<float>>(pymodule, "GaussianObstacle")
+    // and a scalar weight alpha (defaults to 1.0).
+    //
+    // ``GaussianObstacle`` (declared just below) inherits from this
+    // type and adds collision-only metadata (precomputed 3σ extent,
+    // ``min_distance`` cache, ``name``).  Because the inheritance is
+    // declared in the nb::class_ template, ``List[GaussianObstacle]``
+    // passed into the visibility primitives is auto-sliced to
+    // ``List[Gaussian3]`` per-element with no Python-side conversion.
+    nb::class_<vc::Gaussian3<float>>(pymodule, "Gaussian3")
+        .def(
+            "__init__",
+            [](vc::Gaussian3<float> *q,
+               const std::array<float, 3> &mean,
+               const std::array<float, 6> &sigma_upper,
+               float alpha) noexcept
+            {
+                new (q) vc::Gaussian3<float>(
+                    mean[0],
+                    mean[1],
+                    mean[2],
+                    sigma_upper[0],
+                    sigma_upper[1],
+                    sigma_upper[2],
+                    sigma_upper[3],
+                    sigma_upper[4],
+                    sigma_upper[5],
+                    alpha);
+            },
+            "mean"_a,
+            "sigma_upper"_a,
+            "alpha"_a = 1.0F,
+            "Constructor: mean (xyz), covariance upper triangle "
+            "(xx, xy, xz, yy, yz, zz), occupancy weight alpha.")
+        .def_rw("mx", &vc::Gaussian3<float>::mx)
+        .def_rw("my", &vc::Gaussian3<float>::my)
+        .def_rw("mz", &vc::Gaussian3<float>::mz)
+        .def_rw("sigma_xx", &vc::Gaussian3<float>::sigma_xx)
+        .def_rw("sigma_xy", &vc::Gaussian3<float>::sigma_xy)
+        .def_rw("sigma_xz", &vc::Gaussian3<float>::sigma_xz)
+        .def_rw("sigma_yy", &vc::Gaussian3<float>::sigma_yy)
+        .def_rw("sigma_yz", &vc::Gaussian3<float>::sigma_yz)
+        .def_rw("sigma_zz", &vc::Gaussian3<float>::sigma_zz)
+        .def_rw("alpha", &vc::Gaussian3<float>::alpha)
+        .def_prop_ro(
+            "mean",
+            [](vc::Gaussian3<float> &g)
+            { return std::array<float, 3>{g.mx, g.my, g.mz}; })
+        .def_prop_ro(
+            "sigma_upper",
+            [](vc::Gaussian3<float> &g) {
+                return std::array<float, 6>{
+                    g.sigma_xx, g.sigma_xy, g.sigma_xz, g.sigma_yy, g.sigma_yz, g.sigma_zz};
+            })
+        .def("trace_sigma", &vc::Gaussian3<float>::trace_sigma)
+        .def("iso_sigma", &vc::Gaussian3<float>::iso_sigma);
+
+    // Collision-augmented Gaussian: a Gaussian3 plus the AABB-cull
+    // metadata the env query path needs.  Declared as derived from
+    // Gaussian3 so List[GaussianObstacle] auto-slices into the
+    // visibility primitives' List[Gaussian3] argument.
+    nb::class_<vc::GaussianObstacle<float>, vc::Gaussian3<float>>(pymodule, "GaussianObstacle")
         .def(
             "__init__",
             [](vc::GaussianObstacle<float> *q,
@@ -127,27 +189,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             "alpha"_a = 1.0F,
             "Constructor: mean (xyz), covariance upper triangle "
             "(xx, xy, xz, yy, yz, zz), occupancy weight alpha.")
-        .def_ro("mx", &vc::GaussianObstacle<float>::mx)
-        .def_ro("my", &vc::GaussianObstacle<float>::my)
-        .def_ro("mz", &vc::GaussianObstacle<float>::mz)
-        .def_ro("sigma_xx", &vc::GaussianObstacle<float>::sigma_xx)
-        .def_ro("sigma_xy", &vc::GaussianObstacle<float>::sigma_xy)
-        .def_ro("sigma_xz", &vc::GaussianObstacle<float>::sigma_xz)
-        .def_ro("sigma_yy", &vc::GaussianObstacle<float>::sigma_yy)
-        .def_ro("sigma_yz", &vc::GaussianObstacle<float>::sigma_yz)
-        .def_ro("sigma_zz", &vc::GaussianObstacle<float>::sigma_zz)
-        .def_ro("alpha", &vc::GaussianObstacle<float>::alpha)
         .def_ro("three_sigma_extent", &vc::GaussianObstacle<float>::three_sigma_extent)
-        .def_prop_ro(
-            "mean",
-            [](vc::GaussianObstacle<float> &g)
-            { return std::array<float, 3>{g.mx, g.my, g.mz}; })
-        .def_prop_ro(
-            "sigma_upper",
-            [](vc::GaussianObstacle<float> &g) {
-                return std::array<float, 6>{
-                    g.sigma_xx, g.sigma_xy, g.sigma_xz, g.sigma_yy, g.sigma_yz, g.sigma_zz};
-            })
         .def_ro("min_distance", &vc::GaussianObstacle<float>::min_distance)
         .def_rw("name", &vc::GaussianObstacle<float>::name);
 
@@ -288,48 +330,82 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         "covariance given as upper-triangle row-major "
         "(xx, xy, xz, yy, yz, zz).");
 
+    // 3-D observation reward.  Camera at world position (cx, cy, cz)
+    // looking along unit vector (nx, ny, nz).  Per-kernel σ comes from
+    // each Gaussian's covariance (no separate sigma_rho).  Accepts
+    // ``List[Gaussian3]`` or ``List[GaussianObstacle]`` (auto-sliced
+    // via the inheritance declared above).
     pymodule.def(
         "observation_reward",
-        [](float qx, float qy, float phi,
-           float sigma_rho, float d_max, float psi,
-           const std::vector<std::array<float, 4>> &kernels) -> float
+        [](float cx, float cy, float cz,
+           float nx, float ny, float nz,
+           float d_max, float psi,
+           const std::vector<vc::Gaussian3<float>> &gaussians) -> float
         {
-            std::vector<vc::RiskKernel> kv;
-            kv.reserve(kernels.size());
-            for (const auto &k : kernels)
-            {
-                kv.push_back(vc::RiskKernel{k[0], k[1], k[2], k[3]});
-            }
-            return vc::observation_reward(qx, qy, phi, sigma_rho, d_max, psi,
-                                          kv.data(), kv.size());
+            return vc::observation_reward(
+                cx, cy, cz, nx, ny, nz, d_max, psi,
+                gaussians.data(), gaussians.size());
         },
-        "qx"_a, "qy"_a, "phi"_a, "sigma_rho"_a, "d_max"_a, "psi"_a,
-        "kernels"_a,
-        "Camera-cone observation reward O(q, phi) for a sensor at "
-        "(qx, qy) with gaze ``phi`` evaluating a list of risk kernels "
-        "[x, y, z, weight].");
+        "cx"_a, "cy"_a, "cz"_a, "nx"_a, "ny"_a, "nz"_a,
+        "d_max"_a, "psi"_a, "gaussians"_a,
+        "Camera-cone observation reward O(c, n_gaze) for a 3-D camera at "
+        "world position (cx, cy, cz) looking along unit vector (nx, ny, nz). "
+        "Per-kernel angular fraction is the non-central chi-squared (k=2) "
+        "tail under the small-angle approximation (Marcum-Q form); radial "
+        "fraction is the standard-normal CDF mass within d_max.  σ per "
+        "kernel is sqrt(tr(Σ)/3).");
 
+    // 3-D optimal gaze.  Searches (az, el) head-frame offsets within the
+    // head-sweep window and the per-axis joint-limit clamps.  R_head is
+    // row-major 3×3.  Returns (az*, el*, O*).
     pymodule.def(
         "optimal_gaze",
-        [](float qx, float qy, float theta,
-           float sigma_rho, float d_max, float psi, float psi_h,
-           const std::vector<std::array<float, 4>> &kernels,
-           int n_iter) -> std::pair<float, float>
+        [](float cx, float cy, float cz,
+           const std::array<float, 9> &R_head,
+           const std::array<float, 3> &n_ref,
+           float d_max, float psi,
+           float psi_h_az, float psi_h_el,
+           float az_min, float az_max,
+           float el_min, float el_max,
+           const std::vector<vc::Gaussian3<float>> &gaussians,
+           int n_grid, int n_refine) -> std::tuple<float, float, float>
         {
-            std::vector<vc::RiskKernel> kv;
-            kv.reserve(kernels.size());
-            for (const auto &k : kernels)
-            {
-                kv.push_back(vc::RiskKernel{k[0], k[1], k[2], k[3]});
-            }
-            return vc::optimal_gaze(qx, qy, theta, sigma_rho, d_max, psi, psi_h,
-                                    kv.data(), kv.size(), n_iter);
+            return vc::optimal_gaze(
+                cx, cy, cz,
+                R_head[0], R_head[1], R_head[2],
+                R_head[3], R_head[4], R_head[5],
+                R_head[6], R_head[7], R_head[8],
+                n_ref[0], n_ref[1], n_ref[2],
+                d_max, psi,
+                psi_h_az, psi_h_el,
+                az_min, az_max, el_min, el_max,
+                gaussians.data(), gaussians.size(),
+                n_grid, n_refine);
         },
-        "qx"_a, "qy"_a, "theta"_a, "sigma_rho"_a, "d_max"_a, "psi"_a,
-        "psi_h"_a, "kernels"_a, "n_iter"_a = 20,
-        "Bounded golden-section search for the optimal gaze direction "
-        "phi* over the head-sweep range [theta - psi_h/2, theta + psi_h/2]. "
-        "Returns (phi_star, O_star).");
+        "cx"_a, "cy"_a, "cz"_a,
+        "R_head"_a, "n_ref"_a,
+        "d_max"_a, "psi"_a,
+        "psi_h_az"_a, "psi_h_el"_a,
+        "az_min"_a, "az_max"_a, "el_min"_a, "el_max"_a,
+        "gaussians"_a, "n_grid"_a = 9, "n_refine"_a = 20,
+        "Bounded 2-D search for the optimal (az*, el*) head-frame gaze "
+        "offsets maximising the observation reward.  R_head is row-major "
+        "3×3; gaze = R_head · Rz(az) · Ry(el) · n_ref.  Search strategy: "
+        "coarse n_grid×n_grid uniform scan over the window "
+        "[-psi_h_*/2, +psi_h_*/2] ∩ [*_min, *_max], then per-axis "
+        "golden-section refinement around the best cell (n_refine "
+        "iterations each).  Returns (az*, el*, O*).");
+
+    // Direct binding for the non-central chi-squared (k=2) CDF used by
+    // observation_reward.  Exposed for unit testing against scipy.
+    pymodule.def(
+        "ncx2_2_cdf",
+        [](float z, float lam) -> float
+        { return vc::ncx2_2_cdf(z, lam); },
+        "z"_a, "lam"_a,
+        "P[χ²_2(λ) ≤ z] via Helstrom series (N=40 Poisson-mixture "
+        "terms).  Used internally by observation_reward for the 3-D "
+        "angular fraction.");
 
     nb::class_<vc::Attachment<float>>(pymodule, "Attachment")
         .def(

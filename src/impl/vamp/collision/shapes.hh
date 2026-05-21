@@ -4,6 +4,7 @@
 #include <memory>
 
 #include <vamp/vector.hh>
+#include <vamp/collision/gaussian.hh>
 #include <vamp/collision/math.hh>
 
 #include <Eigen/Geometry>
@@ -247,42 +248,30 @@ namespace vamp::collision
 
     // A Gaussian obstacle, used by the probabilistic collision-checking
     // pipeline.  Represents an obstacle whose pose is uncertain (e.g. a
-    // tracked dynamic obstacle from a Kalman filter, or an unknown-region
-    // risk kernel) as a 3D Gaussian: center (mx, my, mz), symmetric 3x3
-    // covariance ``sigma_{xx,xy,xz,yy,yz,zz}``, and an occupancy weight
-    // ``alpha`` (the body-kernel volume α_h from eq:obstacle_psv_approx).
+    // tracked dynamic obstacle from a Kalman filter) as a 3-D Gaussian
+    // distribution plus collision-specific bookkeeping.
     //
-    // ``min_distance`` is the conservative Euclidean lower bound on the
-    // mean's distance from the world origin, minus a 3σ margin along
-    // the covariance's largest axis.  It enables the same early-exit
-    // sort + cull pattern the deterministic shapes use in ``validity.hh``.
+    // The Gaussian distribution itself (center, symmetric covariance,
+    // occupancy weight) lives on the ``Gaussian3<DataT>`` base — the
+    // same primary type that visibility / observation-reward consumes
+    // in ``collision/visibility.hh``.  ``GaussianObstacle`` adds:
+    //
+    //   * ``three_sigma_extent`` — 3σ along the largest covariance
+    //     axis (loose upper bound via √tr Σ), precomputed once at
+    //     construction for the env's AABB cull pass.
+    //   * ``Shape::min_distance`` — the conservative lower bound on
+    //     the mean's Euclidean distance from the origin minus that
+    //     3σ margin.  Drives the same early-exit sort + cull pattern
+    //     the deterministic shapes use in ``validity.hh``.
+    //   * ``Shape::name`` — identifier for env-side bookkeeping.
     //
     // Per-sphere collision risk against a Gaussian obstacle is one
     // call to ``vamp::collision::gaussian3_density`` (see
-    // ``collision/sphere_gaussian.hh``).
+    // ``collision/sphere_gaussian.hh``); the visibility path slices
+    // the ``Gaussian3<DataT>`` base off and passes that directly.
     template <typename DataT>
-    struct GaussianObstacle : public Shape<DataT>
+    struct GaussianObstacle : public Gaussian3<DataT>, public Shape<DataT>
     {
-        DataT mx;
-        DataT my;
-        DataT mz;
-
-        // Symmetric covariance — upper triangle, row-major.
-        DataT sigma_xx;
-        DataT sigma_xy;
-        DataT sigma_xz;
-        DataT sigma_yy;
-        DataT sigma_yz;
-        DataT sigma_zz;
-
-        // Occupancy weight (body-kernel mass).  Defaults to 1.
-        DataT alpha;
-
-        // 3σ along the largest axis (computed once at construction).
-        // Used to derive ``min_distance`` for the sort/cull pass and
-        // available to the risk evaluator for Mahalanobis-style early
-        // rejection (sphere centres farther than 3σ from the mean
-        // contribute negligibly to the Gaussian sum).
         DataT three_sigma_extent;
 
         inline constexpr auto compute_extent() noexcept -> DataT
@@ -292,18 +281,24 @@ namespace vamp::collision
             // (always overestimates) but cheap and avoids an eigen
             // decomposition at construction time — perfect for the
             // conservative cull use case.
-            const auto trace = sigma_xx + sigma_yy + sigma_zz;
-            return 3.F * vamp::collision::sqrt(trace);
+            return 3.F * vamp::collision::sqrt(this->trace_sigma());
         }
 
         inline constexpr auto compute_min_distance() noexcept -> DataT
         {
-            const auto d = vamp::collision::sqrt(mx * mx + my * my + mz * mz);
+            const auto d = vamp::collision::sqrt(
+                this->mx * this->mx + this->my * this->my + this->mz * this->mz);
             return d - three_sigma_extent;
         }
 
         GaussianObstacle() = default;
 
+        // Inheritance order is ``Gaussian3 < Shape`` (Gaussian3 first) so
+        // ``GaussianObstacle*`` and the embedded ``Gaussian3*`` share an
+        // address.  nanobind's ``nb::class_<GaussianObstacle, Gaussian3>``
+        // assumes that single-base offset of 0; flipping the order — even
+        // though semantically Shape "wraps" the type — corrupts every
+        // field read through the binding.
         explicit GaussianObstacle(
             DataT mx,
             DataT my,
@@ -315,17 +310,18 @@ namespace vamp::collision
             DataT sigma_yz,  //
             DataT sigma_zz,
             DataT alpha = static_cast<DataT>(1.F))
-          : Shape<DataT>()
-          , mx(mx)
-          , my(my)
-          , mz(mz)
-          , sigma_xx(sigma_xx)
-          , sigma_xy(sigma_xy)
-          , sigma_xz(sigma_xz)
-          , sigma_yy(sigma_yy)
-          , sigma_yz(sigma_yz)
-          , sigma_zz(sigma_zz)
-          , alpha(alpha)
+          : Gaussian3<DataT>(
+                mx,
+                my,
+                mz,
+                sigma_xx,
+                sigma_xy,
+                sigma_xz,
+                sigma_yy,
+                sigma_yz,
+                sigma_zz,
+                alpha)
+          , Shape<DataT>()
         {
             three_sigma_extent = compute_extent();
             Shape<DataT>::min_distance = compute_min_distance();
@@ -333,17 +329,8 @@ namespace vamp::collision
 
         template <typename OtherDataT>
         explicit GaussianObstacle(const GaussianObstacle<OtherDataT> &other)
-          : Shape<DataT>(other)
-          , mx(other.mx)
-          , my(other.my)
-          , mz(other.mz)
-          , sigma_xx(other.sigma_xx)
-          , sigma_xy(other.sigma_xy)
-          , sigma_xz(other.sigma_xz)
-          , sigma_yy(other.sigma_yy)
-          , sigma_yz(other.sigma_yz)
-          , sigma_zz(other.sigma_zz)
-          , alpha(other.alpha)
+          : Gaussian3<DataT>(other)
+          , Shape<DataT>(other)
           , three_sigma_extent(other.three_sigma_extent)
         {
         }

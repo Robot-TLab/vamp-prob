@@ -9,6 +9,7 @@ __all__ = [
     "Sphere",
     "Cuboid",
     "Cylinder",
+    "Gaussian3",
     "GaussianObstacle",
     "RRTCSettings",
     "PRMSettings",
@@ -20,6 +21,7 @@ __all__ = [
     "SimplifyRoutine",
     "filter_pointcloud",
     "gaussian3_density",
+    "ncx2_2_cdf",
     "observation_reward",
     "optimal_gaze",
     ]
@@ -36,6 +38,7 @@ from . import _core
 from ._core import Sphere as Sphere
 from ._core import Cuboid as Cuboid
 from ._core import Cylinder as Cylinder
+from ._core import Gaussian3 as Gaussian3
 from ._core import GaussianObstacle as GaussianObstacle
 from ._core import Attachment as Attachment
 from ._core import Environment as Environment
@@ -49,6 +52,7 @@ from ._core import SimplifyRoutine as SimplifyRoutine
 from ._core import SimplifySettings as SimplifySettings
 from ._core import filter_pointcloud as filter_pointcloud
 from ._core import gaussian3_density as gaussian3_density
+from ._core import ncx2_2_cdf as ncx2_2_cdf
 from ._core import observation_reward as observation_reward
 from ._core import optimal_gaze as optimal_gaze
 

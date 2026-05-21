@@ -46,6 +46,111 @@ namespace vamp::collision
         return Sym3{a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4], a[5] + b[5]};
     }
 
+    // Primary 3-D Gaussian distribution: mean + symmetric covariance
+    // (6 upper-triangle entries) + scalar weight ``alpha``.  Used by
+    // every vamp primitive that integrates a 3-D Gaussian — currently
+    // sphere-vs-Gaussian collision risk (``collision/sphere_gaussian.hh``)
+    // and visibility / observation reward (``collision/visibility.hh``).
+    //
+    // ``collision/shapes.hh``'s ``GaussianObstacle`` extends this with
+    // collision-specific metadata (a precomputed 3σ extent for AABB
+    // culling, plus the base-``Shape`` ``name`` / ``min_distance``).
+    // Visibility callers can pass either ``Gaussian3`` or a sliced
+    // ``GaussianObstacle`` — the math only touches the base fields.
+    template <typename DataT>
+    struct Gaussian3
+    {
+        DataT mx;
+        DataT my;
+        DataT mz;
+
+        DataT sigma_xx;
+        DataT sigma_xy;
+        DataT sigma_xz;
+        DataT sigma_yy;
+        DataT sigma_yz;
+        DataT sigma_zz;
+
+        DataT alpha;
+
+        Gaussian3()
+          : mx()
+          , my()
+          , mz()
+          , sigma_xx()
+          , sigma_xy()
+          , sigma_xz()
+          , sigma_yy()
+          , sigma_yz()
+          , sigma_zz()
+          , alpha(static_cast<DataT>(1))
+        {
+        }
+
+        Gaussian3(
+            DataT mx,
+            DataT my,
+            DataT mz,
+            DataT sigma_xx,
+            DataT sigma_xy,
+            DataT sigma_xz,
+            DataT sigma_yy,
+            DataT sigma_yz,
+            DataT sigma_zz,
+            DataT alpha = static_cast<DataT>(1))
+          : mx(mx)
+          , my(my)
+          , mz(mz)
+          , sigma_xx(sigma_xx)
+          , sigma_xy(sigma_xy)
+          , sigma_xz(sigma_xz)
+          , sigma_yy(sigma_yy)
+          , sigma_yz(sigma_yz)
+          , sigma_zz(sigma_zz)
+          , alpha(alpha)
+        {
+        }
+
+        template <typename OtherDataT>
+        explicit Gaussian3(const Gaussian3<OtherDataT> &other)
+          : mx(other.mx)
+          , my(other.my)
+          , mz(other.mz)
+          , sigma_xx(other.sigma_xx)
+          , sigma_xy(other.sigma_xy)
+          , sigma_xz(other.sigma_xz)
+          , sigma_yy(other.sigma_yy)
+          , sigma_yz(other.sigma_yz)
+          , sigma_zz(other.sigma_zz)
+          , alpha(other.alpha)
+        {
+        }
+
+        // Trace of Σ.  Used both as the operator-norm bound for 3σ
+        // extent computation and as the input to ``iso_sigma``.
+        inline constexpr auto trace_sigma() const noexcept -> DataT
+        {
+            return sigma_xx + sigma_yy + sigma_zz;
+        }
+
+        // Isotropic-projection scalar σ = √(tr(Σ)/3).  v1 visibility
+        // uses this as the 1-D bandwidth in the ncx2 angular fraction;
+        // the rigorous anisotropic projection onto the plane orthogonal
+        // to the gaze direction is a future extension that will replace
+        // this call site without changing the visibility surface.
+        inline auto iso_sigma() const noexcept -> DataT
+        {
+            return vamp::collision::sqrt(trace_sigma() / static_cast<DataT>(3));
+        }
+
+        // Pack the symmetric covariance into a ``Sym3``.  Convenience
+        // for callers that hand it on to ``sym3_*`` / ``gaussian3_density``.
+        inline constexpr auto sigma_sym3() const noexcept -> Sym3
+        {
+            return Sym3{sigma_xx, sigma_xy, sigma_xz, sigma_yy, sigma_yz, sigma_zz};
+        }
+    };
+
     // Determinant of a 3x3 symmetric matrix in ``Sym3`` layout.
     inline constexpr auto sym3_det(const Sym3 &m) noexcept -> float
     {
