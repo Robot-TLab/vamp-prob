@@ -332,7 +332,7 @@ namespace vamp::collision
         // smooth across the bracket (which it is — σ-controlled
         // angular noise — once the bracket is small enough that no
         // kernel jumps in or out of the cone within it).
-        auto bracket_lo = [&](int idx, int n, float lo, float step) -> float
+        auto bracket_lo = [&](int idx, int /*n*/, float lo, float step) -> float
         {
             const int prev = (idx > 0) ? idx - 1 : idx;
             return lo + step * static_cast<float>(prev);
