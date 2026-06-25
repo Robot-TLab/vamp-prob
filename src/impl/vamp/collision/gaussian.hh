@@ -46,17 +46,13 @@ namespace vamp::collision
         return Sym3{a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4], a[5] + b[5]};
     }
 
-    // Primary 3-D Gaussian distribution: mean + symmetric covariance
-    // (6 upper-triangle entries) + scalar weight ``alpha``.  Used by
-    // every vamp primitive that integrates a 3-D Gaussian — currently
-    // sphere-vs-Gaussian collision risk (``collision/sphere_gaussian.hh``)
-    // and visibility / observation reward (``collision/visibility.hh``).
-    //
-    // ``collision/shapes.hh``'s ``GaussianObstacle`` extends this with
-    // collision-specific metadata (a precomputed 3σ extent for AABB
-    // culling, plus the base-``Shape`` ``name`` / ``min_distance``).
-    // Visibility callers can pass either ``Gaussian3`` or a sliced
-    // ``GaussianObstacle`` — the math only touches the base fields.
+    // The 3-D Gaussian distribution: mean + symmetric covariance
+    // (6 upper-triangle entries) + scalar weight ``alpha``.  This is the
+    // single Gaussian type used by every vamp primitive that integrates a
+    // 3-D Gaussian — sphere-vs-Gaussian collision risk
+    // (``collision/gaussian_gaussian.hh``), the indexed risk population
+    // (``collision/gaussian_tree.hh``), and visibility / observation reward
+    // (``collision/visibility.hh``) all consume it directly.
     template <typename DataT>
     struct Gaussian3
     {

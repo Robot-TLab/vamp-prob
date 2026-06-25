@@ -609,6 +609,37 @@ namespace vamp
             return x;
         }
 
+        // exp(x) via the cephes ``expf`` scheme: range-reduce x = k·ln2 + r,
+        // evaluate a degree-5 minimax polynomial for exp(r) on the reduced
+        // range, then scale by 2^k built directly into the float exponent bits.
+        // (Not ``constexpr`` because it uses the ``floor`` intrinsic.)
+        template <unsigned int = 0>
+        inline static auto exp(VectorT x) noexcept -> VectorT
+        {
+            const auto one = constant(1.0F);
+            x = clamp(x, constant(-88.3762626647949F), constant(88.3762626647949F));
+
+            // k = floor(x·log2(e) + 0.5);  r = x − k·ln2  (hi/lo split for fp32).
+            auto fx = add(mul(x, constant(1.44269504088896341F)), constant(0.5F));
+            fx = floor(fx);
+            x = sub(x, mul(fx, constant(0.693359375F)));
+            x = sub(x, mul(fx, constant(-2.12194440e-4F)));
+
+            const auto z = mul(x, x);
+            auto y = constant(1.9875691500E-4F);
+            y = add(mul(y, x), constant(1.3981999507E-3F));
+            y = add(mul(y, x), constant(8.3334519073E-3F));
+            y = add(mul(y, x), constant(4.1665795894E-2F));
+            y = add(mul(y, x), constant(1.6666665459E-1F));
+            y = add(mul(y, x), constant(5.0000001201E-1F));
+            y = add(add(mul(y, z), x), one);
+
+            // 2^k: (int(k) + 127) << 23, reinterpreted as float.
+            const __m256i pow2 = _mm256_slli_epi32(
+                _mm256_add_epi32(_mm256_cvtps_epi32(fx), _mm256_set1_epi32(0x7f)), 23);
+            return mul(y, _mm256_castsi256_ps(pow2));
+        }
+
         template <unsigned int = 0>
         inline static constexpr auto blend(VectorT a, VectorT b, VectorT blend_mask) noexcept -> VectorT
         {

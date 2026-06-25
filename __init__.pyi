@@ -610,24 +610,6 @@ class Gaussian3:
 
     def iso_sigma(self) -> float: ...
 
-class GaussianObstacle(Gaussian3):
-    def __init__(self, mean: Sequence[float], sigma_upper: Sequence[float], alpha: float = 1.0) -> None:
-        """
-        Constructor: mean (xyz), covariance upper triangle (xx, xy, xz, yy, yz, zz), occupancy weight alpha.
-        """
-
-    @property
-    def three_sigma_extent(self) -> float: ...
-
-    @property
-    def min_distance(self) -> float: ...
-
-    @property
-    def name(self) -> str: ...
-
-    @name.setter
-    def name(self, arg: str, /) -> None: ...
-
 def make_heightfield(arg0: Sequence[float], arg1: Sequence[float], arg2: Sequence[int], arg3: Sequence[float], /) -> HeightField: ...
 
 class HeightField:
@@ -663,8 +645,6 @@ class Environment:
 
     def add_heightfield(self, arg: HeightField, /) -> None: ...
 
-    def add_gaussian_obstacle(self, arg: GaussianObstacle, /) -> None: ...
-
     def add_pointcloud(self, arg0: Sequence[Sequence[float]], arg1: float, arg2: float, arg3: float, /) -> int: ...
 
     def attach(self, arg: Attachment, /) -> None: ...
@@ -691,9 +671,6 @@ class Environment:
 
     @property
     def pointclouds(self) -> list["vamp::collision::CAPT"]: ...
-
-    @property
-    def gaussian_obstacles(self) -> list[GaussianObstacle]: ...
 
 @overload
 def filter_pointcloud(arg0: Sequence[Sequence[float]], arg1: float, arg2: float, arg3: Sequence[float], arg4: Sequence[float], arg5: Sequence[float], arg6: bool, /) -> tuple[list[list[float]], int]: ...

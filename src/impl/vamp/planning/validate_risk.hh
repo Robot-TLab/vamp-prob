@@ -79,7 +79,7 @@ namespace vamp::planning
     // helper used by both ``validate_motion_risk`` and
     // ``validate_config_risk``.
     template <typename Robot, std::size_t rake>
-    inline auto block_risk(
+    inline auto evaluate_risk(
         const typename Robot::template ConfigurationBlock<rake> &block,
         const collision::Environment<float> &env,
         const FloatVector<rake, Robot::n_sigma_q> &sigma_q_block) noexcept -> std::array<float, rake>
@@ -87,35 +87,27 @@ namespace vamp::planning
         typename Robot::template SpheresWithCov<rake> spheres;
         Robot::template sphere_fk_with_cov<rake>(block, sigma_q_block, spheres);
 
-        std::array<float, rake> risks{};
-
-        // Per-sphere, per-lane risk accumulation.  The per-sphere
-        // covariance is already assembled by the codegen (Σ_r^s
-        // includes r_s²·I), so we just hand each (centre, Σ) to the
-        // existing ``sphere_environment_risk`` for the obstacle scan.
+        // Keep the rake packed.  Each sphere row is a ``FloatVector<rake>``
+        // (the ``rake`` configurations of that sphere), so the robot body
+        // is a ``Gaussian3<FloatVector<rake>>`` and every obstacle is
+        // evaluated against all rake lanes in one SIMD step — the same
+        // robot-vs-environment SIMD the deterministic
+        // ``sphere_environment_in_collision`` uses.  Σ_r^s already has
+        // r_s²·I folded in by the FK codegen.
+        using FV = FloatVector<rake>;
+        FV risk_acc = FV::fill(0.0F);
+        const FV one = FV::fill(1.0F);
         for (std::size_t s = 0; s < Robot::n_spheres; ++s)
         {
-            for (std::size_t lane = 0; lane < rake; ++lane)
-            {
-                const float cs_x = spheres.x[{s, lane}];
-                const float cs_y = spheres.y[{s, lane}];
-                const float cs_z = spheres.z[{s, lane}];
-                const float r_s = spheres.r[{s, lane}];
-
-                collision::Sym3 sigma_rs{
-                    spheres.sigma_xx[{s, lane}],
-                    spheres.sigma_xy[{s, lane}],
-                    spheres.sigma_xz[{s, lane}],
-                    spheres.sigma_yy[{s, lane}],
-                    spheres.sigma_yz[{s, lane}],
-                    spheres.sigma_zz[{s, lane}],
-                };
-
-                risks[lane] += sphere_environment_risk(env, cs_x, cs_y, cs_z, r_s, sigma_rs);
-            }
+            const collision::Gaussian3<FV> robot{
+                spheres.x[s],        spheres.y[s],        spheres.z[s],
+                spheres.sigma_xx[s], spheres.sigma_xy[s], spheres.sigma_xz[s],
+                spheres.sigma_yy[s], spheres.sigma_yz[s], spheres.sigma_zz[s],
+                one};
+            risk_acc = risk_acc + sphere_environment_risk<FV>(env, robot);
         }
 
-        return risks;
+        return risk_acc.to_array();
     }
 
     // Per-configuration risk: probabilistic counterpart to single-state
@@ -137,7 +129,7 @@ namespace vamp::planning
         }
 
         const auto sigma_q_block = broadcast_sigma_q<rake, Robot::n_sigma_q>(sigma_q);
-        const auto risks = block_risk<Robot, rake>(block, env, sigma_q_block);
+        const auto risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
         return risks[0];
     }
 
@@ -178,7 +170,7 @@ namespace vamp::planning
         result.per_waypoint_risk.reserve(rake * n);
 
         // First rake-block (the K end-points of the substep sweep).
-        auto risks = block_risk<Robot, rake>(block, env, sigma_q_block);
+        auto risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
         for (auto lane = 0U; lane < rake; ++lane)
         {
             result.per_waypoint_risk.push_back(risks[lane]);
@@ -200,7 +192,7 @@ namespace vamp::planning
             {
                 block[j] = block[j] - backstep.broadcast(j);
             }
-            risks = block_risk<Robot, rake>(block, env, sigma_q_block);
+            risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
             for (auto lane = 0U; lane < rake; ++lane)
             {
                 result.per_waypoint_risk.push_back(risks[lane]);

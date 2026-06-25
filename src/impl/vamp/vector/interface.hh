@@ -429,6 +429,11 @@ namespace vamp
             return D(apply<S::template log<0>>(d()->data));
         }
 
+        inline auto exp() const noexcept -> D
+        {
+            return D(apply<S::template exp<0>>(d()->data));
+        }
+
         inline constexpr auto remove_corrupted() const noexcept -> D
         {
             auto mask = sub(*d());

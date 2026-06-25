@@ -1,78 +1,71 @@
 #pragma once
 
-// Per-sphere collision-risk evaluator over a probabilistic
-// ``Environment``.  This is the probabilistic counterpart to
-// ``validity.hh::sphere_environment_in_collision``: same iteration
-// pattern (sorted obstacles + early-exit cull on ``min_distance``)
-// but the inner function evaluates a Gaussian kernel and sums into
-// a scalar risk instead of testing a boolean overlap.
+// Per-sphere collision-risk evaluator over a probabilistic ``Environment``.
+// The probabilistic counterpart to
+// ``validity.hh::sphere_environment_in_collision``: instead of a boolean
+// overlap test, each robot-body sphere (a Gaussian ``N(c_s, Σ_r^s)``, Σ
+// propagated by the cricket FK codegen) contributes the summed Gaussian-product
+// overlap against the environment's Gaussian obstacle population.
 //
-// Scope (v1):
-//   - Iterates ``env.gaussian_obstacles`` only.
-//   - Static-map Diracs from ``env.pointclouds`` are *not* iterated
-//     yet: the CAPT stores points in a private SIMD-aligned layout
-//     without a public iterator, and exposing one is a separate
-//     concern from this PR.  Callers who need static-map risk should
-//     either (a) encode static voxels as ``GaussianObstacle``s with
-//     small body-only covariance, or (b) wait for the follow-up
-//     that adds a const-iterator accessor to ``CAPT``.
+// Written ``DataT``-generic like the collision primitive: the robot body is a
+// Gaussian carried in ``DataT`` arithmetic, so the same body serves a scalar
+// evaluation (``DataT = float``) or a whole rake of configurations
+// (``DataT = FloatVector<rake>``); the rake batching is the driver's job
+// (``planning/validate_risk.hh``).
 //
-// The caller (typically the edge driver in
-// ``planning/validate_risk.hh``) supplies the per-sphere covariance
-// ``Σ_r^s`` already assembled — this matches the cricket-emitted
-// ``sphere_fk_with_cov`` output, where ``Σ_r^s = J_s Σ_q J_s^T +
-// r_s²·I`` is computed inside the FK codegen and arrives in
-// ``SpheresWithCov<rake>`` alongside the centre.
+// The obstacle population is ``env.gaussian_trees`` — one or more
+// ``GaussianTree`` indices, each summed by a complete range descent
+// (``GaussianTree::sum_overlap``).  A blob obstacle and a static-map cloud point
+// are the same thing — a 3-D Gaussian — so they share this one structure.  The
+// descent is per-config (each lane's sphere centre takes a distinct tree path),
+// so for a rake the lanes are unpacked, queried one at a time, and repacked.
+
+#include <array>
+#include <type_traits>
 
 #include <vamp/collision/environment.hh>
 #include <vamp/collision/gaussian.hh>
-#include <vamp/collision/math.hh>
-#include <vamp/collision/sphere_gaussian.hh>
 
 namespace vamp
 {
-    // Per-sphere risk: sum of Gaussian-product contributions from every
-    // tracked Gaussian obstacle whose 3σ extent overlaps a generous
-    // cull window around the sphere centre.  Returns the value that
-    // the union-of-spheres approximation (eq:waypoint_bound) sums
-    // across spheres to obtain the per-waypoint risk.
-    //
-    //   c_s            sphere centre in world frame
-    //   r_s            sphere radius (used only for the cull radius)
-    //   sigma_rs       fully-assembled per-sphere covariance Σ_r^s =
-    //                  J_s · Σ_q · J_s^T + r_s²·I.  Comes directly
-    //                  from the cricket-emitted SpheresWithCov<rake>.
-    //                  Pass ``sym3_iso(r_s * r_s)`` for the stopped-
-    //                  base degenerate case (no uncertainty).
-    // Iterates the *scalar* float environment.  Obstacle fields
-    // (min_distance, three_sigma_extent, mean, covariance) are scalar
-    // floats — every per-sphere per-lane evaluation is a scalar
-    // Gaussian product.  SIMD vectorisation in the planner happens
-    // across rake lanes inside ``validate_motion_risk``; this inner
-    // loop runs scalar so the comparison + cull logic stays simple.
+    template <typename DataT>
     inline auto sphere_environment_risk(
         const collision::Environment<float> &e,
-        float cs_x,
-        float cs_y,
-        float cs_z,
-        float r_s,
-        const collision::Sym3 &sigma_rs) noexcept -> float
+        const collision::Gaussian3<DataT> &robot) noexcept -> DataT
     {
-        const auto centre_extent = collision::sqrt(cs_x * cs_x + cs_y * cs_y + cs_z * cs_z) + r_s;
+        DataT risk = DataT(0.0F);
 
-        float risk = 0.F;
-        for (const auto &g : e.gaussian_obstacles)
+        if constexpr (std::is_same_v<DataT, float>)
         {
-            // Early-exit cull.  Obstacles are sorted by ``min_distance``
-            // (the obstacle's mean-to-origin distance minus its 3σ
-            // extent).  Once an obstacle's ``min_distance`` exceeds the
-            // sphere's reach, every subsequent obstacle is even farther
-            // and contributes negligibly.
-            if (g.min_distance > centre_extent + g.three_sigma_extent)
+            for (const auto &tree : e.gaussian_trees)
             {
-                break;
+                risk = risk + tree.sum_overlap(robot);
             }
-            risk += collision::sphere_risk_against_gaussian(cs_x, cs_y, cs_z, sigma_rs, g);
+        }
+        else if (not e.gaussian_trees.empty())
+        {
+            const auto mx = robot.mx.to_array();
+            const auto my = robot.my.to_array();
+            const auto mz = robot.mz.to_array();
+            const auto sxx = robot.sigma_xx.to_array();
+            const auto sxy = robot.sigma_xy.to_array();
+            const auto sxz = robot.sigma_xz.to_array();
+            const auto syy = robot.sigma_yy.to_array();
+            const auto syz = robot.sigma_yz.to_array();
+            const auto szz = robot.sigma_zz.to_array();
+            const auto al = robot.alpha.to_array();
+            for (const auto &tree : e.gaussian_trees)
+            {
+                std::array<float, DataT::num_scalars> lane_risk{};
+                for (std::size_t l = 0; l < DataT::num_scalars; ++l)
+                {
+                    const collision::Gaussian3<float> robot_l{
+                        mx[l],  my[l],  mz[l],  sxx[l], sxy[l],
+                        sxz[l], syy[l], syz[l], szz[l], al[l]};
+                    lane_risk[l] = tree.sum_overlap(robot_l);
+                }
+                risk = risk + DataT(lane_risk);
+            }
         }
         return risk;
     }

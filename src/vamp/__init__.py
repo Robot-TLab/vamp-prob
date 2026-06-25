@@ -10,7 +10,6 @@ __all__ = [
     "Cuboid",
     "Cylinder",
     "Gaussian3",
-    "GaussianObstacle",
     "RRTCSettings",
     "PRMSettings",
     "PRMNeighborParams",
@@ -39,7 +38,6 @@ from ._core import Sphere as Sphere
 from ._core import Cuboid as Cuboid
 from ._core import Cylinder as Cylinder
 from ._core import Gaussian3 as Gaussian3
-from ._core import GaussianObstacle as GaussianObstacle
 from ._core import Attachment as Attachment
 from ._core import Environment as Environment
 from ._core import PRMNeighborParams as PRMNeighborParams

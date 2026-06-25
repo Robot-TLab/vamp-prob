@@ -67,7 +67,7 @@ namespace vamp::collision
 
     // Scalar exp / standard-normal CDF used by the probabilistic
     // collision-checking primitives in ``collision/gaussian.hh``,
-    // ``collision/sphere_gaussian.hh`` and ``collision/visibility.hh``.
+    // ``collision/gaussian_gaussian.hh`` and ``collision/visibility.hh``.
     //
     // Both functions operate per-sample (one float in → one float out).
     // The probabilistic primitives are themselves applied per sphere /
@@ -88,6 +88,23 @@ namespace vamp::collision
     inline constexpr auto exp<float>(const float &v) -> float
     {
         return std::exp(v);
+    }
+
+    // Reciprocal 1/v.  ``float`` is exact; the SIMD-lane form uses the hardware
+    // ``rcp`` (≈12-bit) refined by one Newton step (≈24-bit ≈ full fp32) — a
+    // deliberate speed-over-``operator/`` choice, ample for the per-element
+    // Gaussian-density math.  Lets ``DataT``-generic code read like the scalar.
+    template <typename DataT>
+    inline auto rcp(const DataT &v) -> DataT
+    {
+        const DataT r = v.rcp();
+        return r * (DataT::fill(2.0F) - v * r);
+    }
+
+    template <>
+    inline auto rcp<float>(const float &v) -> float
+    {
+        return 1.0F / v;
     }
 
     // Standard-normal CDF Φ(x) = 0.5·(1 + erf(x / √2)).

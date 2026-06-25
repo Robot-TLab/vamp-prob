@@ -104,14 +104,9 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
     // collision risk, visibility / observation reward, ...).  Mean
     // (mx, my, mz), symmetric covariance laid out as upper triangle
     // (sigma_xx, sigma_xy, sigma_xz, sigma_yy, sigma_yz, sigma_zz),
-    // and a scalar weight alpha (defaults to 1.0).
-    //
-    // ``GaussianObstacle`` (declared just below) inherits from this
-    // type and adds collision-only metadata (precomputed 3σ extent,
-    // ``min_distance`` cache, ``name``).  Because the inheritance is
-    // declared in the nb::class_ template, ``List[GaussianObstacle]``
-    // passed into the visibility primitives is auto-sliced to
-    // ``List[Gaussian3]`` per-element with no Python-side conversion.
+    // and a scalar weight alpha (defaults to 1.0).  This is the one
+    // Gaussian type: the risk path sums it and the visibility primitives
+    // consume it directly.
     nb::class_<vc::Gaussian3<float>>(pymodule, "Gaussian3")
         .def(
             "__init__",
@@ -160,38 +155,6 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         .def("trace_sigma", &vc::Gaussian3<float>::trace_sigma)
         .def("iso_sigma", &vc::Gaussian3<float>::iso_sigma);
 
-    // Collision-augmented Gaussian: a Gaussian3 plus the AABB-cull
-    // metadata the env query path needs.  Declared as derived from
-    // Gaussian3 so List[GaussianObstacle] auto-slices into the
-    // visibility primitives' List[Gaussian3] argument.
-    nb::class_<vc::GaussianObstacle<float>, vc::Gaussian3<float>>(pymodule, "GaussianObstacle")
-        .def(
-            "__init__",
-            [](vc::GaussianObstacle<float> *q,
-               const std::array<float, 3> &mean,
-               const std::array<float, 6> &sigma_upper,
-               float alpha) noexcept
-            {
-                new (q) vc::GaussianObstacle<float>(
-                    mean[0],
-                    mean[1],
-                    mean[2],
-                    sigma_upper[0],
-                    sigma_upper[1],
-                    sigma_upper[2],
-                    sigma_upper[3],
-                    sigma_upper[4],
-                    sigma_upper[5],
-                    alpha);
-            },
-            "mean"_a,
-            "sigma_upper"_a,
-            "alpha"_a = 1.0F,
-            "Constructor: mean (xyz), covariance upper triangle "
-            "(xx, xy, xz, yy, yz, zz), occupancy weight alpha.")
-        .def_ro("three_sigma_extent", &vc::GaussianObstacle<float>::three_sigma_extent)
-        .def_ro("min_distance", &vc::GaussianObstacle<float>::min_distance)
-        .def_rw("name", &vc::GaussianObstacle<float>::name);
 
     pymodule.def("make_heightfield", &vf::heightfield::array);
 
@@ -246,13 +209,6 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             [](vc::Environment<float> &e, const vc::HeightField<float> &s)
             { e.heightfields.emplace_back(s); })
         .def(
-            "add_gaussian_obstacle",
-            [](vc::Environment<float> &e, const vc::GaussianObstacle<float> &g)
-            {
-                e.gaussian_obstacles.emplace_back(g);
-                e.sort();
-            })
-        .def(
             "add_pointcloud",
             [](vc::Environment<float> &e,
                const std::vector<collision::Point> &pc,
@@ -274,8 +230,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         .def_ro("capsules", &vc::Environment<float>::capsules)
         .def_ro("z_aligned_capsules", &vc::Environment<float>::z_aligned_capsules)
         .def_ro("heightfields", &vc::Environment<float>::heightfields)
-        .def_ro("pointclouds", &vc::Environment<float>::pointclouds)
-        .def_ro("gaussian_obstacles", &vc::Environment<float>::gaussian_obstacles);
+        .def_ro("pointclouds", &vc::Environment<float>::pointclouds);
 
     pymodule.def(
         "filter_pointcloud",
@@ -333,8 +288,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
     // 3-D observation reward.  Camera at world position (cx, cy, cz)
     // looking along unit vector (nx, ny, nz).  Per-kernel σ comes from
     // each Gaussian's covariance (no separate sigma_rho).  Accepts
-    // ``List[Gaussian3]`` or ``List[GaussianObstacle]`` (auto-sliced
-    // via the inheritance declared above).
+    // ``List[Gaussian3]``.
     pymodule.def(
         "observation_reward",
         [](float cx, float cy, float cz,

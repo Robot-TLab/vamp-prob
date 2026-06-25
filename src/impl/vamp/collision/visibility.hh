@@ -40,9 +40,9 @@
 // per-call inputs.  The camera world pose comes from the caller (a
 // higher-level planner) via full-body FK; vamp doesn't know about
 // joints or trajectories.  The kernel list is just ``Gaussian3<float>``,
-// the same primary type collision uses (``GaussianObstacle`` slices
-// down to it).  λ_s / λ_d priors stay outside vamp — callers fold
-// them into each kernel's ``alpha`` weight upstream.
+// the same primary type the collision-risk path uses.  λ_s / λ_d priors
+// stay outside vamp — callers fold them into each kernel's ``alpha``
+// weight upstream.
 //
 // No SDF / raycasting in v1.  The paper's factorisation drops
 // occlusion masking; visibility against ``Environment.pointclouds``
