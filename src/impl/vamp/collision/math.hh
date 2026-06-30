@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+
+#include <vamp/vector.hh>
 
 namespace vamp::collision
 {
@@ -65,18 +68,19 @@ namespace vamp::collision
         return std::sqrt(v);
     }
 
-    // Scalar exp / standard-normal CDF used by the probabilistic
-    // collision-checking primitives in ``collision/gaussian.hh``,
-    // ``collision/gaussian_gaussian.hh`` and ``collision/visibility.hh``.
+    // exp / standard-normal CDF / non-central χ²₂ CDF used by the
+    // probabilistic collision-checking and visibility primitives in
+    // ``collision/gaussian.hh``, ``collision/gaussian_gaussian.hh`` and
+    // ``collision/visibility.hh``.
     //
-    // Both functions operate per-sample (one float in → one float out).
-    // The probabilistic primitives are themselves applied per sphere /
-    // per kernel; we never need rake-vectorized ``exp``/``erf`` here
-    // because the SIMD parallelism in the risk evaluator is over
-    // *configurations* (the existing FK rake path), not over per-sphere
-    // Gaussian terms.  If profiling later shows the inner Gaussian
-    // evaluation becoming a bottleneck, vectorized polynomial-approx
-    // ``exp``/``erf`` overloads can be added without changing callers.
+    // Each comes in two forms: a scalar ``float`` path (exact libm) and a
+    // ``DataT``-generic / rake overload that packs a whole SIMD vector of
+    // samples.  The collision-risk path packs *stored Gaussians* per lane
+    // (``GaussianTree``); ``observation_reward`` packs *kernels* the same
+    // way, so its inner loop needs ``exp``/``erf``/``ncx2`` per lane.  The
+    // float forms stay for scalar callers and as the exact reference the
+    // rake forms are validated against (and, for ``ncx2_2_cdf``, the
+    // per-lane fp64 fallback).
 
     template <typename DataT>
     inline constexpr auto exp(const DataT &v) -> DataT
@@ -108,17 +112,38 @@ namespace vamp::collision
     }
 
     // Standard-normal CDF Φ(x) = 0.5·(1 + erf(x / √2)).
+    //
+    // Rake form: vectorized erf via the Abramowitz & Stegun 7.1.26
+    // rational-times-Gaussian approximation (max abs error 1.5e-7 ≈ fp32 ε),
+    // built from the lane type's exp / abs / blend.  ``observation_reward``
+    // routes its radial fraction Φ((d_max − r)/σ) through this, lane-packed
+    // over kernels.  The scalar ``float`` specialization below keeps libm erf.
     template <typename DataT>
-    inline constexpr auto normal_cdf(const DataT &v) -> DataT
+    inline auto normal_cdf(const DataT &v) -> DataT
     {
-        // No SIMD-lane fallback yet (would require .erf() on DataT);
-        // see the comment above this block.  Until then, the scalar
-        // ``float`` specialization is the only supported instantiation.
-        static_assert(
-            sizeof(DataT) == 0,
-            "normal_cdf is only specialized for ``float``; rake-vectorized "
-            "callers should reduce to scalar before invoking.");
-        return v;
+        constexpr float INV_SQRT_2 = 0.7071067811865475F;  // 1 / sqrt(2)
+        constexpr float P = 0.3275911F;
+        constexpr float A1 = 0.254829592F;
+        constexpr float A2 = -0.284496736F;
+        constexpr float A3 = 1.421413741F;
+        constexpr float A4 = -1.453152027F;
+        constexpr float A5 = 1.061405429F;
+
+        const DataT x = v * INV_SQRT_2;  // erf argument
+        const DataT ax = x.abs();
+        const DataT t = rcp(DataT::fill(1.0F) + ax * P);
+        DataT poly = DataT::fill(A5);
+        poly = poly * t + A4;
+        poly = poly * t + A3;
+        poly = poly * t + A2;
+        poly = poly * t + A1;
+        poly = poly * t;  // (a1 t + … + a5 t⁵)
+        const DataT erf_abs = DataT::fill(1.0F) - poly * (-(x * x)).exp();
+
+        // erf is odd; Φ(x) = 0.5·(1 ± erf(|x|)) for x ≷ 0.
+        const DataT phi_hi = (erf_abs + 1.0F) * 0.5F;
+        const DataT phi_lo = (DataT::fill(1.0F) - erf_abs) * 0.5F;
+        return phi_hi.blend(phi_lo, x.less_than(DataT::fill(0.0F)));
     }
 
     template <>
@@ -146,6 +171,42 @@ namespace vamp::collision
         cx = ay * bz - az * by;
         cy = az * bx - ax * bz;
         cz = ax * by - ay * bx;
+    }
+
+    // atan2(y, x) for SIMD lane types (scalar callers use ``std::atan2``).
+    // Range-reduces to atan on [0, 1] via the standard |y| ≷ |x| swap,
+    // evaluates a degree-9 odd minimax polynomial (max abs error ~1.3e-5
+    // rad), then folds in the quadrant from the signs of x and y.
+    // ``visibility.hh`` feeds it ‖u × n‖ ≥ 0 and ⟨u, n⟩, so the result lands
+    // in [0, π] — the same value the scalar ``std::atan2(cross_norm, dot)``
+    // returns there; the y < 0 branch is kept for a correct general atan2.
+    template <typename DataT>
+    inline auto atan2(const DataT &y, const DataT &x) -> DataT
+    {
+        constexpr float HALF_PI = 1.5707963267948966F;
+        constexpr float PI = 3.141592653589793F;
+
+        const DataT ax = x.abs();
+        const DataT ay = y.abs();
+        const DataT swap = ay.greater_than(ax);  // |y| > |x|
+        const DataT num = ay.blend(ax, swap);    // min(|x|, |y|)
+        const DataT den = ax.blend(ay, swap);    // max(|x|, |y|)
+        const DataT a = num * rcp(den.max(DataT::fill(1.0e-30F)));
+        const DataT a2 = a * a;
+
+        // atan(a), a ∈ [0, 1].
+        DataT p = DataT::fill(0.0208351F);
+        p = p * a2 + (-0.0851330F);
+        p = p * a2 + 0.1801410F;
+        p = p * a2 + (-0.3302995F);
+        p = p * a2 + 0.9998660F;
+        p = p * a;
+
+        // Undo the swap, then fold the quadrant from sign(x), sign(y).
+        p = p.blend(HALF_PI - p, swap);
+        p = p.blend(PI - p, x.less_than(DataT::fill(0.0F)));
+        p = p.blend(-p, y.less_than(DataT::fill(0.0F)));
+        return p;
     }
 
     // Non-central chi-squared (k = 2) CDF via Helstrom's series.  Used
@@ -195,8 +256,7 @@ namespace vamp::collision
         // N to comfortably bracket whichever is larger; +25 buys ~1e-10
         // Poisson tail.  Cap at 1024 so worst-case rake-of-configs
         // callers stay bounded (most calls land far below).
-        const int N_target = static_cast<int>(
-            std::ceil(std::max(half_z_d, half_lam_d))) + 25;
+        const int N_target = static_cast<int>(std::ceil(std::max(half_z_d, half_lam_d))) + 25;
         const int N = (N_target > 1024) ? 1024 : (N_target < 40 ? 40 : N_target);
 
         // ``pois_term`` carries the actual Poisson PMF
@@ -227,5 +287,45 @@ namespace vamp::collision
             acc += pois_term * chi2k_cdf;
         }
         return static_cast<float>(acc);
+    }
+
+    // Rake counterpart of ``ncx2_2_cdf`` above: the non-central χ²₂ CDF for a
+    // whole SIMD vector of (z, λ) lanes at once, so ``observation_reward`` can
+    // route its angular fraction through SIMD the way the collision-risk path
+    // runs ``gaussian_gaussian`` over packed Gaussians.
+    //
+    // This is the Sankaran (1959, 1963) cube-root normal approximation rather
+    // than the scalar path's Poisson-mixture series.  The series is exact but
+    // single precision can't hold it: ``exp(-λ/2)`` underflows past λ≈170 and
+    // the ``(z/2)^i/i!`` partial sums overflow past z≈1400 (where even the
+    // scalar fp64 form NaNs) — and a visibility scene of tight kernels lives
+    // mostly in that high-(z, λ) tail (off-axis splats).  Sankaran maps
+    // ``(X/(k+λ))^h`` to a standard normal; it is closed-form (no per-lane
+    // loop), smooth, monotone, and NaN-free across the whole range — z ≤ 0 → 0
+    // and z ≫ mean → 1 fall straight out of the Φ.  Max abs error vs SciPy is
+    // ~1e-2 near the cone boundary at small λ (where the reward only feeds an
+    // argmax) and ~1e-3 in the large-λ tail; the scalar overload above stays
+    // for the SciPy-tested binding and any exact scalar caller.
+    template <std::size_t rake>
+    inline auto ncx2_2_cdf(const FloatVector<rake> &z, const FloatVector<rake> &lam) noexcept
+        -> FloatVector<rake>
+    {
+        using FV = FloatVector<rake>;
+        const FV a = lam + 2.0F;         // k + λ      (k = 2)
+        const FV b = lam * 2.0F + 2.0F;  // k + 2λ
+        const FV c = lam * 3.0F + 2.0F;  // k + 3λ
+
+        const FV inv_b = rcp(b);
+        const FV h = FV::fill(1.0F) - (a * c) * (inv_b * inv_b) * (2.0F / 3.0F);
+        const FV p = b * (rcp(a) * rcp(a));  // (k + 2λ) / (k + λ)²
+        const FV m = (h - 1.0F) * (FV::fill(1.0F) - h * 3.0F);
+
+        // (X / (k+λ))^h via exp(h·log(·)); the floor keeps log finite at z = 0.
+        const FV xa = (z * rcp(a)).max(FV::fill(1.0e-30F));
+        const FV base = (h * xa.log()).exp();
+
+        const FV num = base - (FV::fill(1.0F) + h * p * (h - 1.0F) - h * p * m * 0.5F);
+        const FV den = h * (p * 2.0F).sqrt() * (FV::fill(1.0F) + m * p * 0.5F);
+        return normal_cdf(num * rcp(den));
     }
 }  // namespace vamp::collision

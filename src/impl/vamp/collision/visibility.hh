@@ -49,24 +49,75 @@
 // (map-based occlusion) is a separate primitive that can be added
 // later without changing this API.
 //
-// SIMD: this primitive is scalar per Gaussian, matching the existing
-// scalar style of ``normal_cdf`` / ``exp`` in ``collision/math.hh``.
-// The collision pipeline's rake-of-configs SIMD parallelism lives at
-// the FK layer (sphere_fk over 8 candidate configs at a time); the
-// planner wrapper that calls this primitive should likewise FK in
-// rake, extract per-lane camera poses, and call ``observation_reward``
-// once per lane.  See ``vamp::planning::validate_config_risk`` for the
-// analogous pattern on the collision side.
+// SIMD: ``observation_reward`` packs the Gaussian kernels into SIMD lanes
+// and evaluates the per-kernel reward a whole vector at a time, exactly
+// mirroring the collision-risk path — ``GaussianTree::descend`` broadcasts
+// one query and runs ``gaussian_gaussian`` against the *stored* Gaussians
+// packed ``num_scalars`` per block, then horizontally sums.  Here the camera
+// pose ``(c, n_gaze)`` is the broadcast query and the kernels are the packed
+// set: ‖u × n‖, ⟨u, n⟩, the angle, the radial Φ and the angular χ²₂ tail all
+// run in lane arithmetic (``cross_3`` / ``atan2`` / ``normal_cdf`` /
+// ``ncx2_2_cdf`` from ``collision/math.hh``), and one ``hsum`` collapses the
+// lanes to the scalar reward.  ``optimal_gaze`` inherits the speedup through
+// its per-candidate calls; a planner is still free to rake over camera poses
+// one level up (each lane a scalar ``observation_reward``).
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <tuple>
+#include <vector>
 
 #include <vamp/collision/gaussian.hh>
 #include <vamp/collision/math.hh>
+#include <vamp/vector.hh>
 
 namespace vamp::collision
 {
+    // Full-fp32 square root: one Newton step off the fast 12-bit ``v·rsqrt(v)``
+    // seed, refined with the (Newton-refined) ``rcp``.  The radial Φ and angular
+    // χ²₂ tail are near-step functions for tight kernels, so the bare 12-bit
+    // sqrt's 3.7e-4 relative error in r / σ / ‖u×n‖ would smear the reward by
+    // ~0.04 per kernel near a boundary (and drift from the exact scalar path).
+    // Argument must be > 0 (callers floor the radicand).
+    inline auto precise_sqrt(const FloatVector<> &x) noexcept -> FloatVector<>
+    {
+        const auto s = x.sqrt();
+        return (s + x * vamp::collision::rcp(s)) * 0.5F;
+    }
+
+    // Per-kernel angular fraction f^a = P[χ²₂(λ) ≤ z] for a packed lane of
+    // kernels, given their unit directions ``u`` to the camera, the per-kernel
+    // ``scale = r/σ`` and ``z = (ψ/2·scale)²`` (both gaze-independent), and a
+    // broadcast gaze direction ``n_gaze``.  λ = (δ·scale)² with
+    // δ = ∠(u, n_gaze) = atan2(‖u×n‖, ⟨u,n⟩) (precise near 0 and π).  This is
+    // the *only* part of the reward that changes as the gaze sweeps, so it is
+    // factored out and shared by ``observation_reward`` and ``optimal_gaze``.
+    inline auto angular_fraction(
+        const FloatVector<> &ux,
+        const FloatVector<> &uy,
+        const FloatVector<> &uz,
+        const FloatVector<> &scale,
+        const FloatVector<> &z,
+        const FloatVector<> &nxv,
+        const FloatVector<> &nyv,
+        const FloatVector<> &nzv) noexcept -> FloatVector<>
+    {
+        using FV = FloatVector<>;
+        FV cxn;
+        FV cyn;
+        FV czn;
+        vamp::collision::cross_3(ux, uy, uz, nxv, nyv, nzv, cxn, cyn, czn);
+        // ‖u×n‖² floored before the sqrt: u ∥ n_gaze (on-axis / antipodal) makes
+        // it 0, and the rsqrt-based sqrt would turn sqrt(0) into 0·∞ = NaN; the
+        // floor (≈1e-10 in ‖u×n‖) lands atan2 at δ ≈ 0 or π, as intended.
+        const FV cross_norm = precise_sqrt((cxn * cxn + cyn * cyn + czn * czn).max(FV::fill(1.0e-20F)));
+        const FV dot_un = ux * nxv + uy * nyv + uz * nzv;
+        const FV delta = vamp::collision::atan2(cross_norm, dot_un);
+        const FV lam = (delta * scale) * (delta * scale);
+        return vamp::collision::ncx2_2_cdf(z, lam);
+    }
+
     // Camera-cone observation reward for camera at world position ``c``
     // looking along unit vector ``n_gaze`` (world frame).
     //
@@ -91,64 +142,84 @@ namespace vamp::collision
         const Gaussian3<float> *gaussians,
         std::size_t n_gaussians) noexcept -> float
     {
-        constexpr float SIGMA_EPS = 1.0e-9F;  // floor avoids division-by-zero
+        using FV = FloatVector<>;
+        constexpr std::size_t W = FV::num_scalars;
+        constexpr float SIGMA_EPS = 1.0e-9F;  // σ floor: division-by-zero guard
                                               // on caller-supplied delta kernels
-        const float half_psi = 0.5F * psi;
-        float reward = 0.0F;
+        constexpr float R_EPS = 1.0e-6F;      // degenerate kernel-on-camera radius
 
-        for (std::size_t k = 0; k < n_gaussians; ++k)
+        // The camera pose is the broadcast "query"; the kernels are the packed
+        // set (cf. ``GaussianTree::descend``: one query, stored Gaussians per lane).
+        const FV nxv = FV::fill(nx);
+        const FV nyv = FV::fill(ny);
+        const FV nzv = FV::fill(nz);
+        const FV half_psi = FV::fill(0.5F * psi);
+
+        FV acc = FV::fill(0.0F);
+        for (std::size_t base = 0; base < n_gaussians; base += W)
         {
-            const auto &g = gaussians[k];
-
-            const float dx = g.mx - cx;
-            const float dy = g.my - cy;
-            const float dz = g.mz - cz;
-            const float r2 = dx * dx + dy * dy + dz * dz;
-            const float r_k = vamp::collision::sqrt(r2);
-
-            const float sigma_k_raw = g.iso_sigma();
-            const float sigma_k = (sigma_k_raw > SIGMA_EPS) ? sigma_k_raw : SIGMA_EPS;
-
-            // Degenerate kernel sitting on the camera — contributes
-            // the full mass if it's also within range.  (r_k ≈ 0
-            // implies σ_k/r_k → ∞ angular noise, i.e. uniform on the
-            // sphere; the cone captures fraction (1 − cos(ψ/2))/2 of
-            // a uniform distribution.  For the visibility use case
-            // we treat this as "fully visible if in range" — the
-            // alternative would propagate NaN through atan2.)
-            if (r_k < 1.0e-6F)
+            // Struct-of-arrays pack of up to W kernels.  Only the diagonal of Σ
+            // feeds the isotropic σ = √(tr(Σ)/3); the visibility math needs no
+            // off-diagonal terms.  Padding lanes carry a finite dummy pose with
+            // α = 0 so they contribute exactly 0 — no +inf mean (which would
+            // make u = d·(1/r) a 0·∞ NaN, unlike the Gaussian-product path).
+            alignas(FV::S::Alignment) std::array<float, W> amx;
+            alignas(FV::S::Alignment) std::array<float, W> amy;
+            alignas(FV::S::Alignment) std::array<float, W> amz;
+            alignas(FV::S::Alignment) std::array<float, W> atrace;
+            alignas(FV::S::Alignment) std::array<float, W> aalpha;
+            for (std::size_t l = 0; l < W; ++l)
             {
-                const float f_r0 = vamp::collision::normal_cdf(d_max / sigma_k);
-                reward += g.alpha * f_r0;
-                continue;
+                const std::size_t k = base + l;
+                if (k < n_gaussians)
+                {
+                    const auto &g = gaussians[k];
+                    amx[l] = g.mx;
+                    amy[l] = g.my;
+                    amz[l] = g.mz;
+                    atrace[l] = g.sigma_xx + g.sigma_yy + g.sigma_zz;
+                    aalpha[l] = g.alpha;
+                }
+                else
+                {
+                    amx[l] = cx + 1.0F;
+                    amy[l] = cy;
+                    amz[l] = cz;
+                    atrace[l] = 3.0F;
+                    aalpha[l] = 0.0F;
+                }
             }
 
-            const float inv_r = 1.0F / r_k;
-            const float ux = dx * inv_r;
-            const float uy = dy * inv_r;
-            const float uz = dz * inv_r;
+            const FV dx = FV(amx.data(), true) - cx;
+            const FV dy = FV(amy.data(), true) - cy;
+            const FV dz = FV(amz.data(), true) - cz;
+            const FV alpha = FV(aalpha.data(), true);
 
-            // δ_k = ∠(u_k, n_gaze) via atan2(‖u × n‖, ⟨u, n⟩) for
-            // better precision near 0 and π than acos(dot).
-            float cxn;
-            float cyn;
-            float czn;
-            vamp::collision::cross_3(ux, uy, uz, nx, ny, nz, cxn, cyn, czn);
-            const float cross_norm = vamp::collision::sqrt(cxn * cxn + cyn * cyn + czn * czn);
-            const float dot_un = ux * nx + uy * ny + uz * nz;
-            const float delta_k = std::atan2(cross_norm, dot_un);
+            // r² is exact (never NaN), so it gives both the degenerate test and,
+            // floored before the sqrt, a finite r — the AVX sqrt is v·rsqrt(v),
+            // so an unfloored sqrt(0) would be 0·∞ = NaN and break the blend.
+            const FV r2 = dx * dx + dy * dy + dz * dz;
+            const FV degen = r2.less_than(FV::fill(R_EPS * R_EPS));      // kernel on camera
+            const FV r = precise_sqrt(r2.max(FV::fill(R_EPS * R_EPS)));  // finite, ≥ R_EPS
+            const FV sigma =
+                precise_sqrt((FV(atrace.data(), true) * (1.0F / 3.0F)).max(FV::fill(SIGMA_EPS * SIGMA_EPS)));
+            const FV inv_sigma = vamp::collision::rcp(sigma);
+            const FV inv_r = vamp::collision::rcp(r);  // r ≥ R_EPS
 
-            const float scale = r_k / sigma_k;
-            const float lam_k = (delta_k * scale) * (delta_k * scale);
-            const float z_k = (half_psi * scale) * (half_psi * scale);
+            const FV scale = r * inv_sigma;  // r / σ
+            const FV z = (half_psi * scale) * (half_psi * scale);
+            const FV f_a = angular_fraction(dx * inv_r, dy * inv_r, dz * inv_r, scale, z, nxv, nyv, nzv);
+            const FV f_r = vamp::collision::normal_cdf((d_max - r) * inv_sigma);
+            const FV contrib = alpha * f_a * f_r;
 
-            const float f_a = vamp::collision::ncx2_2_cdf(z_k, lam_k);
-            const float f_r = vamp::collision::normal_cdf((d_max - r_k) / sigma_k);
-
-            reward += g.alpha * f_a * f_r;
+            // Degenerate kernel sitting on the camera (r ≈ 0): the angular noise
+            // σ/r → ∞ makes it "fully visible if in range", so the angular
+            // fraction collapses to 1 and only the radial Φ(d_max/σ) gates it.
+            const FV contrib_degen = alpha * vamp::collision::normal_cdf(FV::fill(d_max) * inv_sigma);
+            acc = acc + contrib.blend(contrib_degen, degen);
         }
 
-        return reward;
+        return acc.hsum();
     }
 
     // Internal helper for ``optimal_gaze``: build ``R_gaze · n_ref``
@@ -268,6 +339,160 @@ namespace vamp::collision
         const float el_lo_eff = (el_lo <= el_hi) ? el_lo : 0.5F * (el_lo + el_hi);
         const float el_hi_eff = (el_lo <= el_hi) ? el_hi : el_lo_eff;
 
+        // Precompute the gaze-independent per-kernel terms ONCE.  As the gaze
+        // sweeps the search window only δ = ∠(u, n_gaze) changes; the camera
+        // position, kernel geometry (r, σ), radial fraction f^r and z all stay
+        // fixed.  Caching them as packed SoA lanes means each of the n_grid² +
+        // refinement evaluations below does only the angle-dependent work
+        // (``angular_fraction``) instead of re-packing the Gaussian array and
+        // recomputing every sqrt / Φ — the bulk of the per-evaluation cost.
+        // Kernels on the camera (r ≈ 0) are fully visible if in range,
+        // gaze-independently, so they fold into the constant ``base``.
+        using FV = FloatVector<>;
+        constexpr std::size_t W = FV::num_scalars;
+        constexpr float SIGMA_EPS = 1.0e-9F;
+        constexpr float R_EPS = 1.0e-6F;
+        constexpr float PI = 3.141592653589793F;
+        const FV half_psi = FV::fill(0.5F * psi);
+
+        // Cull kernels that cannot contribute to ANY reachable gaze, once, up
+        // front — the dominant cost is the per-candidate sweep below, so every
+        // kernel dropped here is dropped from all n_grid² + refinement
+        // evaluations.  A kernel is irrelevant if it is out of range for every
+        // gaze (r > d_max + 6σ ⇒ radial Φ < 1e-9) or its direction lies outside
+        // the union of all reachable cones: the central gaze n_center = R_head·
+        // n_ref, widened by the FoV half-angle ψ/2, the head-sweep half-width Θ
+        // (a generous sum-of-axes bound), and a 6σ-angular margin folded into a
+        // fixed 0.5 rad slack.  Margins are deliberately loose so the cull never
+        // drops a kernel that carries non-negligible reward.
+        float ncx;
+        float ncy;
+        float ncz;
+        compose_gaze(
+            r00, r01, r02, r10, r11, r12, r20, r21, r22, nx_ref, ny_ref, nz_ref, 0.0F, 0.0F, ncx, ncy, ncz);
+        const float theta = std::max(std::abs(az_lo_eff), std::abs(az_hi_eff)) +
+                            std::max(std::abs(el_lo_eff), std::abs(el_hi_eff));
+        const float ang_thresh = 0.5F * psi + theta + 0.5F;
+        // cos_thresh = −2 ⇒ angular test always passes (whole sphere reachable).
+        const float cos_thresh = (ang_thresh < PI) ? std::cos(ang_thresh) : -2.0F;
+
+        std::vector<std::size_t> survivors;
+        survivors.reserve(n_gaussians);
+        for (std::size_t k = 0; k < n_gaussians; ++k)
+        {
+            const auto &g = gaussians[k];
+            const float dx = g.mx - cx;
+            const float dy = g.my - cy;
+            const float dz = g.mz - cz;
+            const float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < R_EPS * R_EPS)
+            {
+                survivors.push_back(k);  // degenerate kernel on camera — always relevant
+                continue;
+            }
+            const float sigma =
+                std::sqrt(std::max((g.sigma_xx + g.sigma_yy + g.sigma_zz) / 3.0F, SIGMA_EPS * SIGMA_EPS));
+            const float r = std::sqrt(r2);
+            if (r > d_max + 6.0F * sigma)
+            {
+                continue;  // radial cull
+            }
+            // u·n_center ≥ cos_thresh  ⟺  (d·n_center) ≥ r·cos_thresh.
+            const float dot = dx * ncx + dy * ncy + dz * ncz;
+            if (dot < r * cos_thresh)
+            {
+                continue;  // angular cull
+            }
+            survivors.push_back(k);
+        }
+
+        // The gaze sweep below must hit microsecond latency over many kernels,
+        // which rules out the smooth ncx2/erf reward per candidate (≈3
+        // transcendentals/kernel).  Each surviving kernel is instead reduced to
+        // a piecewise-linear cone ramp: f^a ≈ 1 for δ < ψ/2 − 2σ/r, 0 for
+        // δ > ψ/2 + 2σ/r, linear in cos δ between (the ncx2 tail's boundary and
+        // ≈2σ/r transition width).  The thresholds (cos of the two angles) and
+        // the radial weight α·f^r are precomputed ONCE here, so each gaze
+        // evaluation is just a dot product, a clamp and a multiply-add — no
+        // transcendentals.  Approximation matches the smooth model at the
+        // boundary (both = ½) and in the in/out limits; it is the deliberate
+        // accuracy-for-speed trade for the search (the standalone
+        // ``observation_reward`` keeps the exact model).
+        const std::size_t n_surv = survivors.size();
+        const std::size_t n_blocks = (n_surv + W - 1) / W;
+        std::vector<FV> k_ux(n_blocks);
+        std::vector<FV> k_uy(n_blocks);
+        std::vector<FV> k_uz(n_blocks);
+        std::vector<FV> k_coshi(n_blocks);     // cos(ψ/2 + 2σ/r): outer ramp edge
+        std::vector<FV> k_invrange(n_blocks);  // 1 / (cos(inner) − cos(outer))
+        std::vector<FV> k_scale(n_blocks);     // r/σ — for the exact O* at the chosen gaze
+        std::vector<FV> k_z(n_blocks);         // (ψ/2·scale)² — for the exact O*
+        std::vector<FV> k_w(n_blocks);         // α·f^r; 0 on degenerate / padding lanes
+        float base = 0.0F;
+        for (std::size_t b = 0; b < n_blocks; ++b)
+        {
+            alignas(FV::S::Alignment) std::array<float, W> amx;
+            alignas(FV::S::Alignment) std::array<float, W> amy;
+            alignas(FV::S::Alignment) std::array<float, W> amz;
+            alignas(FV::S::Alignment) std::array<float, W> atrace;
+            alignas(FV::S::Alignment) std::array<float, W> aalpha;
+            for (std::size_t l = 0; l < W; ++l)
+            {
+                const std::size_t si = b * W + l;
+                if (si < n_surv)
+                {
+                    const auto &g = gaussians[survivors[si]];
+                    amx[l] = g.mx;
+                    amy[l] = g.my;
+                    amz[l] = g.mz;
+                    atrace[l] = g.sigma_xx + g.sigma_yy + g.sigma_zz;
+                    aalpha[l] = g.alpha;
+                }
+                else
+                {
+                    amx[l] = cx + 1.0F;
+                    amy[l] = cy;
+                    amz[l] = cz;
+                    atrace[l] = 3.0F;
+                    aalpha[l] = 0.0F;
+                }
+            }
+
+            const FV dx = FV(amx.data(), true) - cx;
+            const FV dy = FV(amy.data(), true) - cy;
+            const FV dz = FV(amz.data(), true) - cz;
+            const FV alpha = FV(aalpha.data(), true);
+
+            const FV r2 = dx * dx + dy * dy + dz * dz;
+            const FV degen = r2.less_than(FV::fill(R_EPS * R_EPS));
+            const FV r = precise_sqrt(r2.max(FV::fill(R_EPS * R_EPS)));
+            const FV sigma =
+                precise_sqrt((FV(atrace.data(), true) * (1.0F / 3.0F)).max(FV::fill(SIGMA_EPS * SIGMA_EPS)));
+            const FV inv_sigma = vamp::collision::rcp(sigma);
+            const FV inv_r = vamp::collision::rcp(r);
+            const FV scale = r * inv_sigma;
+            const FV f_r = vamp::collision::normal_cdf((d_max - r) * inv_sigma);
+
+            // Cone-ramp edges in cos δ.  2σ/r is the angular transition width.
+            const FV delta_w = (sigma * inv_r) * 2.0F;
+            const FV cos_hi = (half_psi + delta_w).clamp(0.0F, PI).cos();  // outer (δ = ψ/2 + 2σ/r)
+            const FV cos_lo = (half_psi - delta_w).clamp(0.0F, PI).cos();  // inner (δ = ψ/2 − 2σ/r)
+
+            // Degenerate (r ≈ 0) lanes: α·Φ(d_max/σ) for any gaze → constant base.
+            base += FV::fill(0.0F)
+                        .blend(alpha * vamp::collision::normal_cdf(FV::fill(d_max) * inv_sigma), degen)
+                        .hsum();
+
+            k_ux[b] = dx * inv_r;
+            k_uy[b] = dy * inv_r;
+            k_uz[b] = dz * inv_r;
+            k_coshi[b] = cos_hi;
+            k_invrange[b] = vamp::collision::rcp((cos_lo - cos_hi).max(FV::fill(1.0e-6F)));
+            k_scale[b] = scale;
+            k_z[b] = (half_psi * scale) * (half_psi * scale);
+            k_w[b] = (alpha * f_r).blend(FV::fill(0.0F), degen);  // 0 on degenerate / padding
+        }
+
         auto reward_at = [&](float az, float el) -> float
         {
             float nx_g;
@@ -291,8 +516,64 @@ namespace vamp::collision
                 nx_g,
                 ny_g,
                 nz_g);
-            return observation_reward(
-                cx, cy, cz, nx_g, ny_g, nz_g, d_max, psi, gaussians, n_gaussians);
+            const FV nxv = FV::fill(nx_g);
+            const FV nyv = FV::fill(ny_g);
+            const FV nzv = FV::fill(nz_g);
+            // ε·(u·n) alignment tiebreak: the clamp zeroes the ramp outside the
+            // cone, which would drop the smooth reward's monotone-in-cos δ
+            // gradient — the bit that still aims the gaze at the nearest kernel
+            // when it sits in the flat-top cap (any in-cone direction scores 1)
+            // or entirely outside every reachable cone.  Re-add it at a weight
+            // small enough never to outrank an actual in-cone kernel.
+            constexpr float EPS_ALIGN = 1.0e-2F;
+            FV acc = FV::fill(0.0F);
+            for (std::size_t b = 0; b < n_blocks; ++b)
+            {
+                const FV dot = k_ux[b] * nxv + k_uy[b] * nyv + k_uz[b] * nzv;  // cos δ
+                const FV s = ((dot - k_coshi[b]) * k_invrange[b]).clamp(0.0F, 1.0F);
+                acc = acc + k_w[b] * (s + dot * EPS_ALIGN);
+            }
+            return base + acc.hsum();
+        };
+
+        // Exact reward at one gaze (smooth ncx2 angular fraction).  Used only to
+        // report O* at the chosen gaze: the cheap ramp + ε·alignment above steers
+        // the search, but the returned O* feeds a hard visibility constraint
+        // (O* ≥ O_min), so it must match the smooth ``observation_reward`` model
+        // rather than carry the ramp's approximation or the ε tiebreak offset.
+        auto accurate_reward_at = [&](float az, float el) -> float
+        {
+            float nx_g;
+            float ny_g;
+            float nz_g;
+            compose_gaze(
+                r00,
+                r01,
+                r02,
+                r10,
+                r11,
+                r12,
+                r20,
+                r21,
+                r22,
+                nx_ref,
+                ny_ref,
+                nz_ref,
+                az,
+                el,
+                nx_g,
+                ny_g,
+                nz_g);
+            const FV nxv = FV::fill(nx_g);
+            const FV nyv = FV::fill(ny_g);
+            const FV nzv = FV::fill(nz_g);
+            FV acc = FV::fill(0.0F);
+            for (std::size_t b = 0; b < n_blocks; ++b)
+            {
+                acc = acc +
+                      k_w[b] * angular_fraction(k_ux[b], k_uy[b], k_uz[b], k_scale[b], k_z[b], nxv, nyv, nzv);
+            }
+            return base + acc.hsum();
         };
 
         if (n_grid < 2)
@@ -417,7 +698,7 @@ namespace vamp::collision
             el_star = (fc > fd) ? c : d;
         }
 
-        const float o_star = reward_at(az_star, el_star);
+        const float o_star = accurate_reward_at(az_star, el_star);
         return {az_star, el_star, o_star};
     }
 }  // namespace vamp::collision
