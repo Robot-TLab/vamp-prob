@@ -40,7 +40,13 @@ namespace vamp::collision
         // the combined covariance the overlap is < e^{-kRiskSigma²/2} and is
         // dropped.  The reach is taken along √tr(Σ) ≥ √λ_max — a safe
         // over-estimate that never prunes a contributing Gaussian.
-        static constexpr float kRiskSigma = 5.0F;
+        //
+        // 2σ: for a dense surface cloud the 5σ default summed ~50x more
+        // near-zero-tail Gaussians than carry any risk (measured: 481k vs 10k
+        // in-range/waypoint at 5σ vs 3σ on the RLS scene).  At 2σ the per-pair
+        // weight at the cutoff is e^{-2} ≈ 0.135, so it under-counts the risk
+        // tail by ~13% (the conservative direction is a *larger* budget margin).
+        static constexpr float kRiskSigma = 2.0F;
 
         // Leaf bucket size: a node with at most this many Gaussians becomes a
         // leaf whose members are summed as contiguous SIMD blocks.
@@ -101,6 +107,35 @@ namespace vamp::collision
                 FVectorT::fill(query.sigma_yy), FVectorT::fill(query.sigma_yz),
                 FVectorT::fill(query.sigma_zz), FVectorT::fill(query.alpha)};
             return descend(0, center, reach * reach, query_v);
+        }
+
+        // Packed counterpart of ``sum_overlap``: the query carries ``rake``
+        // distinct lanes (e.g. the rake of *adjacent* edge waypoints of one body
+        // sphere), and the return is the per-lane overlap sum.  ONE descent
+        // serves every lane — a subtree is pruned only when *all* lanes are out
+        // of reach — and each leaf broadcasts its stored Gaussians against the
+        // packed query, so the lanes stay packed end to end: no per-lane tree
+        // walk, no unpack/rebroadcast (cf. the scalar path's per-lane loop in
+        // ``risk_validity.hh``).  A lane for which a visited Gaussian is far just
+        // gets a vanishing tail contribution, so the result matches the scalar
+        // path to within the same e^{-kRiskSigma²/2} cull.  Requires the caller
+        // to pack *spatially close* lanes, else the shared descent over-includes.
+        template <std::size_t rake>
+        [[nodiscard]] auto sum_overlap(const Gaussian3<FloatVector<rake>> &query) const noexcept
+            -> FloatVector<rake>
+        {
+            using FV = FloatVector<rake>;
+            if (nodes.empty())
+            {
+                return FV::fill(0.0F);
+            }
+            // Per-lane reach²: (kRiskSigma·√(tr(Σ_query)+max_trace))².
+            const FV reach_sq =
+                (query.sigma_xx + query.sigma_yy + query.sigma_zz + FV::fill(max_trace)) *
+                FV::fill(kRiskSigma * kRiskSigma);
+            FV acc = FV::fill(0.0F);
+            descend_simd<rake>(0, query, reach_sq, acc);
+            return acc;
         }
 
       private:
@@ -221,6 +256,64 @@ namespace vamp::collision
 
             return descend(nd.left, center, reach_sq, query_v) +
                    descend(nd.right, center, reach_sq, query_v);
+        }
+
+        // Packed descent for ``sum_overlap``: prune a subtree only when *every*
+        // lane is out of reach, and accumulate per-lane at the leaves by
+        // broadcasting each stored Gaussian against the rake-packed query.
+        template <std::size_t rake>
+        void descend_simd(
+            std::int32_t n,
+            const Gaussian3<FloatVector<rake>> &query,
+            const FloatVector<rake> &reach_sq,
+            FloatVector<rake> &acc) const noexcept
+        {
+            using FV = FloatVector<rake>;
+            const Node &nd = nodes[n];
+
+            // Distance² from the node's mean-bounding box to each lane's query
+            // centre, all lanes at once.
+            const FV dx = query.mx - query.mx.clamp(nd.box.lower[0], nd.box.upper[0]);
+            const FV dy = query.my - query.my.clamp(nd.box.lower[1], nd.box.upper[1]);
+            const FV dz = query.mz - query.mz.clamp(nd.box.lower[2], nd.box.upper[2]);
+            const FV dsq = dx * dx + dy * dy + dz * dz;
+            // Prune the whole subtree only when no lane can reach it.
+            if (dsq.test_all_greater_equal(reach_sq))
+            {
+                return;
+            }
+
+            if (nd.left < 0)
+            {
+                const std::uint32_t end = nd.block_begin + nd.block_count;
+                for (std::uint32_t b = nd.block_begin; b < end; ++b)
+                {
+                    const auto mx = leaf_blocks[0][b].to_array();
+                    const auto my = leaf_blocks[1][b].to_array();
+                    const auto mz = leaf_blocks[2][b].to_array();
+                    const auto sxx = leaf_blocks[3][b].to_array();
+                    const auto sxy = leaf_blocks[4][b].to_array();
+                    const auto sxz = leaf_blocks[5][b].to_array();
+                    const auto syy = leaf_blocks[6][b].to_array();
+                    const auto syz = leaf_blocks[7][b].to_array();
+                    const auto szz = leaf_blocks[8][b].to_array();
+                    const auto al = leaf_blocks[9][b].to_array();
+                    for (std::size_t l = 0; l < FVectorT::num_scalars; ++l)
+                    {
+                        // Padding lanes carry a +inf mean / zero alpha ⇒ exact 0.
+                        const Gaussian3<FV> stored{
+                            FV::fill(mx[l]),  FV::fill(my[l]),  FV::fill(mz[l]),
+                            FV::fill(sxx[l]), FV::fill(sxy[l]), FV::fill(sxz[l]),
+                            FV::fill(syy[l]), FV::fill(syz[l]), FV::fill(szz[l]),
+                            FV::fill(al[l])};
+                        acc = acc + gaussian_gaussian(query, stored);
+                    }
+                }
+                return;
+            }
+
+            descend_simd<rake>(nd.left, query, reach_sq, acc);
+            descend_simd<rake>(nd.right, query, reach_sq, acc);
         }
     };
 }  // namespace vamp::collision

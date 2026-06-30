@@ -35,37 +35,14 @@ namespace vamp
     {
         DataT risk = DataT(0.0F);
 
-        if constexpr (std::is_same_v<DataT, float>)
+        // ``DataT == float`` selects the scalar ``sum_overlap``; a packed
+        // ``DataT == FloatVector<rake>`` selects the rake-packed overload, which
+        // descends each tree once for *all* lanes and accumulates per-lane.  The
+        // whole risk evaluation thus stays SIMD — no unpack to scalar, no
+        // per-lane tree descent (cf. the old per-lane loop this replaces).
+        for (const auto &tree : e.gaussian_trees)
         {
-            for (const auto &tree : e.gaussian_trees)
-            {
-                risk = risk + tree.sum_overlap(robot);
-            }
-        }
-        else if (not e.gaussian_trees.empty())
-        {
-            const auto mx = robot.mx.to_array();
-            const auto my = robot.my.to_array();
-            const auto mz = robot.mz.to_array();
-            const auto sxx = robot.sigma_xx.to_array();
-            const auto sxy = robot.sigma_xy.to_array();
-            const auto sxz = robot.sigma_xz.to_array();
-            const auto syy = robot.sigma_yy.to_array();
-            const auto syz = robot.sigma_yz.to_array();
-            const auto szz = robot.sigma_zz.to_array();
-            const auto al = robot.alpha.to_array();
-            for (const auto &tree : e.gaussian_trees)
-            {
-                std::array<float, DataT::num_scalars> lane_risk{};
-                for (std::size_t l = 0; l < DataT::num_scalars; ++l)
-                {
-                    const collision::Gaussian3<float> robot_l{
-                        mx[l],  my[l],  mz[l],  sxx[l], sxy[l],
-                        sxz[l], syy[l], syz[l], szz[l], al[l]};
-                    lane_risk[l] = tree.sum_overlap(robot_l);
-                }
-                risk = risk + DataT(lane_risk);
-            }
+            risk = risk + tree.sum_overlap(robot);
         }
         return risk;
     }

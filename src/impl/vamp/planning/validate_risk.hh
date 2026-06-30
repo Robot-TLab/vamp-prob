@@ -152,16 +152,30 @@ namespace vamp::planning
         const auto vector = goal - start;
         const float distance = vector.l2_norm();
 
-        const auto percents = FloatVector<rake>(RiskPercents<rake>::percents);
+        const std::size_t n = std::max(
+            std::ceil(distance / static_cast<float>(rake) * resolution), 1.F);
+
+        // Contiguous waypoint layout: block ``i`` carries the ``rake`` *adjacent*
+        // waypoints at fractions (i·rake + l + 1)/(rake·n).  Packing spatially
+        // close waypoints into one rake lets the GaussianTree descend a whole
+        // block in a single packet walk (``GaussianTree::sum_overlap``), keeping
+        // the risk sum SIMD with no per-lane unpack.  The deterministic validator
+        // spreads the rake across the edge so it can early-exit anywhere; the
+        // risk sum never early-exits within an edge, so it packs tightly.  The
+        // evaluated waypoint *set* {k/(rake·n) : k=1..rake·n} is identical to the
+        // spread layout — only the lane grouping changes.
+        std::array<float, rake> base_p{};
+        for (std::size_t l = 0; l < rake; ++l)
+        {
+            base_p[l] = static_cast<float>(l + 1) / static_cast<float>(rake * n);
+        }
+        const auto base_percents = FloatVector<rake>(base_p);
 
         typename Robot::template ConfigurationBlock<rake> block;
         for (auto i = 0U; i < Robot::dimension; ++i)
         {
-            block[i] = start.broadcast(i) + (vector.broadcast(i) * percents);
+            block[i] = start.broadcast(i) + (vector.broadcast(i) * base_percents);
         }
-
-        const std::size_t n = std::max(
-            std::ceil(distance / static_cast<float>(rake) * resolution), 1.F);
 
         const auto sigma_q_block = broadcast_sigma_q<rake, Robot::n_sigma_q>(sigma_q);
 
@@ -184,13 +198,13 @@ namespace vamp::planning
             return result;
         }
 
-        // Substep back along the edge, evaluating each new rake-block.
-        const auto backstep = vector / static_cast<float>(rake * n);
+        // Step forward one whole rake-block (rake waypoints) per iteration.
+        const auto forward = vector / static_cast<float>(n);
         for (auto i = 1U; i < n; ++i)
         {
             for (auto j = 0U; j < Robot::dimension; ++j)
             {
-                block[j] = block[j] - backstep.broadcast(j);
+                block[j] = block[j] + forward.broadcast(j);
             }
             risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
             for (auto lane = 0U; lane < rake; ++lane)
