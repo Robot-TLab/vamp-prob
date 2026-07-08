@@ -1,22 +1,27 @@
 #pragma once
 
-// ``GaussianTree`` — a spatial index over a set of 3-D Gaussians
-// (``Gaussian3<float>``, any covariance) that returns the summed
-// Gaussian-product overlap against a query Gaussian.
+// ``GaussianTree`` — a spatial index over a set of uncertain obstacle spheres
+// (``Gaussian3<float>``: a Gaussian-uncertain centre + a physical ``radius``)
+// that returns the probability the query body sphere collides with NONE of
+// them — i.e. the noisy-OR "no-collision" product ∏_o (1 − p_o), where each
+// ``p_o`` is the two-uncertain-spheres collision probability
+// (``gaussian_gaussian.hh``).  The caller turns that into a collision
+// probability ``P = 1 − ∏(1 − p_o)`` (noisy-OR across obstacles AND body
+// spheres); nothing is summed and nothing is counted.
 //
-// It is the accelerated, *complete* counterpart of the linear gaussian-obstacle
-// scan in ``risk_validity.hh``: rather than evaluating ``gaussian_gaussian``
-// against every stored Gaussian, it descends a bucketed k-d tree over the
-// Gaussian means and prunes any subtree past the query's reach.  It is fully
-// generic in what it stores — a dense static-map surface enters as
-// zero-covariance Diracs, a tracked obstacle as a blob with Σ_obs > 0 — and is
-// instantiated and filled by the caller (the planner), not auto-built as a vamp
+// This is the "CAPT near obstacles" query the risk evaluator wants: because a
+// far obstacle has ``p_o ≈ 0`` (factor ≈ 1, no effect on the product), the
+// descent prunes any subtree whose obstacle means are past the query's reach
+// ``R + prob_sigma·s`` and only ever touches the handful of near obstacles.
+// Unlike the old density SUM (which demanded completeness — "no in-reach
+// Gaussian may be dropped"), a saturating probability only needs the near ones:
+// a single coincident obstacle drives its factor to 0 and the product to 0
+// (P → 1), so a genuine collision reads ~1 from just a few spheres.
+//
+// It stores whatever the caller fills it with — a dense static-map surface as
+// small-radius spheres, a tracked obstacle as a blob with its own Σ and body
+// radius — and is instantiated by the planner, not auto-built as a vamp
 // primitive.
-//
-// Completeness is the point: a risk is a *sum*, so (unlike the CAPT afford-set
-// boolean, which preserves "some point is near" but not the full near set) no
-// in-reach Gaussian may be dropped.  The descent only prunes Gaussians whose
-// contribution is < e^{-kRiskSigma²/2}.
 
 #include <algorithm>
 #include <array>
@@ -36,25 +41,26 @@ namespace vamp::collision
     {
         using FVectorT = FloatVector<>;
 
-        // Mahalanobis cull radius: past ``kRiskSigma`` standard deviations of
-        // the combined covariance the overlap is < e^{-kRiskSigma²/2} and is
-        // dropped.  The reach is taken along √tr(Σ) ≥ √λ_max — a safe
-        // over-estimate that never prunes a contributing Gaussian.
-        //
-        // 2σ: for a dense surface cloud the 5σ default summed ~50x more
-        // near-zero-tail Gaussians than carry any risk (measured: 481k vs 10k
-        // in-range/waypoint at 5σ vs 3σ on the RLS scene).  At 2σ the per-pair
-        // weight at the cutoff is e^{-2} ≈ 0.135, so it under-counts the risk
-        // tail by ~13% (the conservative direction is a *larger* budget margin).
-        static constexpr float kRiskSigma = 2.0F;
+        // Reach cull: an obstacle at centre-distance d contributes a collision
+        // probability that decays once (d − R)/s exceeds a few standard
+        // deviations of the combined position spread s.  Past ``prob_sigma`` the
+        // per-pair p is < ~e^{−prob_sigma²/2} and the subtree is dropped.  The
+        // reach is taken along √tr(Σ)/√3 ≥ √λ_min and widened by the largest
+        // stored radius/spread, a safe over-estimate that never prunes a
+        // contributing obstacle.  Configurable per tree via the constructor's
+        // ``prob_sigma`` argument; ``kDefaultProbSigma`` is the historical 4.0.
+        // A larger value culls less (more obstacles evaluated, more accurate P);
+        // a smaller value culls more aggressively (faster, drops weaker tails).
+        static constexpr float kDefaultProbSigma = 4.0F;
+        float prob_sigma = kDefaultProbSigma;
 
-        // Leaf bucket size: a node with at most this many Gaussians becomes a
+        // Leaf bucket size: a node with at most this many spheres becomes a
         // leaf whose members are summed as contiguous SIMD blocks.
         static constexpr std::size_t kBucket = 32;
 
         struct Node
         {
-            Volume box;  // bounds the stored Gaussian *means* in this subtree
+            Volume box;  // bounds the stored obstacle *centres* in this subtree
             std::int32_t left = -1;
             std::int32_t right = -1;
             std::uint32_t block_begin = 0;
@@ -63,18 +69,24 @@ namespace vamp::collision
 
         std::vector<Node> nodes;
 
-        // Struct-of-arrays leaf storage: ``FVectorT::num_scalars`` Gaussians per
-        // block, fields in ``Gaussian3`` order (mx, my, mz, σxx, σxy, σxz, σyy,
-        // σyz, σzz, α).  Padding lanes carry a +inf mean (zero overlap).
+        // Struct-of-arrays leaf storage: ``FVectorT::num_scalars`` spheres per
+        // block, fields in ``Gaussian3`` order EXCEPT the 10th slot carries the
+        // physical ``radius`` (the risk path never uses ``alpha``): (mx, my, mz,
+        // σxx, σxy, σxz, σyy, σyz, σzz, radius).  Padding lanes carry a +inf mean
+        // (zero collision probability ⇒ factor 1 in the product).
         std::array<std::vector<FVectorT>, 10> leaf_blocks;
 
-        // Largest tr(Σ) over the stored Gaussians; widens the query reach so a
-        // blob whose spread reaches the query is never pruned.
+        // Largest tr(Σ) and largest radius over the stored spheres; widen the
+        // query reach so a spread-out or large obstacle is never pruned.
         float max_trace = 0.0F;
+        float max_radius = 0.0F;
 
         GaussianTree() = default;
 
-        explicit GaussianTree(std::vector<Gaussian3<float>> gaussians) noexcept
+        explicit GaussianTree(
+            std::vector<Gaussian3<float>> gaussians,
+            float prob_sigma_arg = kDefaultProbSigma) noexcept
+          : prob_sigma(prob_sigma_arg)
         {
             if (gaussians.empty())
             {
@@ -83,59 +95,80 @@ namespace vamp::collision
             for (const auto &g : gaussians)
             {
                 max_trace = std::max(max_trace, g.sigma_xx + g.sigma_yy + g.sigma_zz);
+                max_radius = std::max(max_radius, g.radius);
             }
             nodes.reserve(2 * gaussians.size() / kBucket + 16);
             build(gaussians, 0, static_cast<int>(gaussians.size()));
         }
 
-        // Σ over every stored Gaussian g of gaussian_gaussian(query, g).  Scalar
-        // in the query (a rake's lanes take distinct tree paths, so the rake
-        // batching is the caller's per-lane loop); SIMD over the stored set.
-        [[nodiscard]] auto sum_overlap(const Gaussian3<float> &query) const noexcept -> float
+        // ∏ over every stored obstacle o of (1 − gaussian_gaussian(query, o)) —
+        // the probability the query sphere collides with none of them.  Scalar
+        // in the query (a rake's lanes take distinct tree paths); SIMD over the
+        // stored set.
+        [[nodiscard]] auto no_collision_product(
+            const Gaussian3<float> &query, float min_no_collision = 0.0F) const noexcept
+            -> float
         {
             if (nodes.empty())
             {
-                return 0.0F;
+                return 1.0F;
             }
             const float trace = query.sigma_xx + query.sigma_yy + query.sigma_zz;
-            const float reach = kRiskSigma * std::sqrt(trace + max_trace);
+            // Floor the spread to match the primitive (kSphereSigmaFloorSq) so
+            // the reach never under-estimates for near-zero covariance.
+            const float s =
+                std::sqrt(std::max((trace + max_trace) / 3.0F, kSphereSigmaFloorSq));
+            const float reach = query.radius + max_radius + prob_sigma * s;
             const Point center{query.mx, query.my, query.mz};
             const Gaussian3<FVectorT> query_v{
                 FVectorT::fill(query.mx),       FVectorT::fill(query.my),
                 FVectorT::fill(query.mz),       FVectorT::fill(query.sigma_xx),
                 FVectorT::fill(query.sigma_xy), FVectorT::fill(query.sigma_xz),
                 FVectorT::fill(query.sigma_yy), FVectorT::fill(query.sigma_yz),
-                FVectorT::fill(query.sigma_zz), FVectorT::fill(query.alpha)};
-            return descend(0, center, reach * reach, query_v);
+                FVectorT::fill(query.sigma_zz), FVectorT::fill(query.alpha),
+                FVectorT::fill(query.radius)};
+            return descend(0, center, reach * reach, query_v, min_no_collision);
         }
 
-        // Packed counterpart of ``sum_overlap``: the query carries ``rake``
-        // distinct lanes (e.g. the rake of *adjacent* edge waypoints of one body
-        // sphere), and the return is the per-lane overlap sum.  ONE descent
-        // serves every lane — a subtree is pruned only when *all* lanes are out
-        // of reach — and each leaf broadcasts its stored Gaussians against the
-        // packed query, so the lanes stay packed end to end: no per-lane tree
-        // walk, no unpack/rebroadcast (cf. the scalar path's per-lane loop in
-        // ``risk_validity.hh``).  A lane for which a visited Gaussian is far just
-        // gets a vanishing tail contribution, so the result matches the scalar
-        // path to within the same e^{-kRiskSigma²/2} cull.  Requires the caller
-        // to pack *spatially close* lanes, else the shared descent over-includes.
+        // Packed counterpart of ``no_collision_product``: the query carries
+        // ``rake`` distinct lanes (e.g. the rake of *adjacent* edge waypoints of
+        // one body sphere), and the return is the per-lane no-collision product.
+        // ONE descent serves every lane — a subtree is pruned only when *all*
+        // lanes are out of reach — and each leaf broadcasts its stored spheres
+        // against the packed query, so the lanes stay packed end to end.
+        // Requires the caller to pack *spatially close* lanes, else the shared
+        // descent over-includes.
+        //
+        // ``min_no_collision`` is the noisy-OR reject early-out floor: once every
+        // lane's accumulated no-collision product has dropped to ``≤ floor`` (i.e.
+        // every lane's P ≥ 1 − floor is already over the risk budget), the descent
+        // stops — the remaining obstacles can only lower the product further, so
+        // the edge is already infeasible.  ``0`` disables the early-out (full,
+        // exact product).  The floor is a safe over-approximation: it never stops
+        // before P genuinely exceeds the threshold, so the feasibility verdict is
+        // unchanged; only the reported P of an already-rejected lane is a lower
+        // bound (it is ``≥`` the threshold, hence still rejected).
         template <std::size_t rake>
-        [[nodiscard]] auto sum_overlap(const Gaussian3<FloatVector<rake>> &query) const noexcept
-            -> FloatVector<rake>
+        [[nodiscard]] auto no_collision_product(
+            const Gaussian3<FloatVector<rake>> &query,
+            float min_no_collision = 0.0F) const noexcept -> FloatVector<rake>
         {
             using FV = FloatVector<rake>;
             if (nodes.empty())
             {
-                return FV::fill(0.0F);
+                return FV::fill(1.0F);
             }
-            // Per-lane reach²: (kRiskSigma·√(tr(Σ_query)+max_trace))².
-            const FV reach_sq =
-                (query.sigma_xx + query.sigma_yy + query.sigma_zz + FV::fill(max_trace)) *
-                FV::fill(kRiskSigma * kRiskSigma);
-            FV acc = FV::fill(0.0F);
-            descend_simd<rake>(0, query, reach_sq, acc);
-            return acc;
+            // Per-lane reach² = (r_query + max_radius + kProbSigma·s)², with the
+            // isotropic spread s floored so ``sqrt`` never sees a zero (rsqrt).
+            const FV var =
+                ((query.sigma_xx + query.sigma_yy + query.sigma_zz) + FV::fill(max_trace)) *
+                (1.0F / 3.0F);
+            const FV s = var.max(FV::fill(kSphereSigmaFloorSq)).sqrt();
+            const FV reach = (query.radius + FV::fill(max_radius)) + s * FV::fill(prob_sigma);
+            const FV reach_sq = reach * reach;
+            FV prod = FV::fill(1.0F);
+            descend_simd<rake>(0, query, reach_sq, prod, min_no_collision);
+            return prod;
         }
 
       private:
@@ -207,11 +240,12 @@ namespace vamp::collision
                         f[0][l] = g.mx;       f[1][l] = g.my;       f[2][l] = g.mz;
                         f[3][l] = g.sigma_xx; f[4][l] = g.sigma_xy; f[5][l] = g.sigma_xz;
                         f[6][l] = g.sigma_yy; f[7][l] = g.sigma_yz; f[8][l] = g.sigma_zz;
-                        f[9][l] = g.alpha;
+                        f[9][l] = g.radius;  // 10th slot = physical radius, not alpha
                     }
                     else
                     {
-                        // +inf mean ⇒ zero overlap; remaining fields irrelevant.
+                        // +inf mean ⇒ zero collision probability; remaining
+                        // fields irrelevant (radius left 0).
                         f[0][l] = kInf; f[1][l] = kInf; f[2][l] = kInf;
                     }
                 }
@@ -222,56 +256,82 @@ namespace vamp::collision
             }
         }
 
+        // Scalar-query descent: returns ∏(1 − p) over near obstacles in this
+        // subtree.  Prune ⇒ factor 1 (identity for the product).
         [[nodiscard]] auto descend(
             std::int32_t n,
             const Point &center,
             float reach_sq,
-            const Gaussian3<FVectorT> &query_v) const noexcept -> float
+            const Gaussian3<FVectorT> &query_v,
+            float min_no_collision) const noexcept -> float
         {
             const Node &nd = nodes[n];
             if (nd.box.distsq_to(center) > reach_sq)
             {
-                return 0.0F;
+                return 1.0F;
             }
 
             if (nd.left < 0)
             {
                 const std::uint32_t end = nd.block_begin + nd.block_count;
-                float acc = 0.0F;
+                float prod = 1.0F;
                 for (std::uint32_t b = nd.block_begin; b < end; ++b)
                 {
                     const Gaussian3<FVectorT> stored{
                         leaf_blocks[0][b], leaf_blocks[1][b], leaf_blocks[2][b],
                         leaf_blocks[3][b], leaf_blocks[4][b], leaf_blocks[5][b],
                         leaf_blocks[6][b], leaf_blocks[7][b], leaf_blocks[8][b],
-                        leaf_blocks[9][b]};
-                    const auto contrib = gaussian_gaussian(query_v, stored).to_array();
-                    for (const float v : contrib)
+                        FVectorT::fill(1.0F),  // alpha (unused by collision prob)
+                        leaf_blocks[9][b]};    // radius
+                    const auto p = gaussian_gaussian(query_v, stored).to_array();
+                    for (const float pv : p)
                     {
-                        acc += v;
+                        prod *= (1.0F - pv);
+                    }
+                    // Reject early-out: this subtree alone already saturates P.
+                    if (min_no_collision > 0.0F and prod <= min_no_collision)
+                    {
+                        return prod;
                     }
                 }
-                return acc;
+                return prod;
             }
 
-            return descend(nd.left, center, reach_sq, query_v) +
-                   descend(nd.right, center, reach_sq, query_v);
+            const float pl = descend(nd.left, center, reach_sq, query_v, min_no_collision);
+            if (min_no_collision > 0.0F and pl <= min_no_collision)
+            {
+                return pl;
+            }
+            return pl * descend(nd.right, center, reach_sq, query_v, min_no_collision);
         }
 
-        // Packed descent for ``sum_overlap``: prune a subtree only when *every*
-        // lane is out of reach, and accumulate per-lane at the leaves by
-        // broadcasting each stored Gaussian against the rake-packed query.
+        // Packed descent: multiply per-lane (1 − p) for every near obstacle by
+        // broadcasting each stored sphere against the rake-packed query.  Prune
+        // a subtree only when *every* lane is out of reach.
         template <std::size_t rake>
         void descend_simd(
             std::int32_t n,
             const Gaussian3<FloatVector<rake>> &query,
             const FloatVector<rake> &reach_sq,
-            FloatVector<rake> &acc) const noexcept
+            FloatVector<rake> &prod,
+            float min_no_collision) const noexcept
         {
             using FV = FloatVector<rake>;
+
+            // Reject early-out: every lane's no-collision product is already at or
+            // below the floor (every lane's P is at/over the risk budget), so no
+            // remaining obstacle can change the verdict.  This entry check also
+            // propagates the stop across the recursion — once the left subtree
+            // saturates every lane, the right subtree returns here immediately.
+            if (min_no_collision > 0.0F and
+                prod.test_all_less_equal(FV::fill(min_no_collision)))
+            {
+                return;
+            }
+
             const Node &nd = nodes[n];
 
-            // Distance² from the node's mean-bounding box to each lane's query
+            // Distance² from the node's centre-bounding box to each lane's query
             // centre, all lanes at once.
             const FV dx = query.mx - query.mx.clamp(nd.box.lower[0], nd.box.upper[0]);
             const FV dy = query.my - query.my.clamp(nd.box.lower[1], nd.box.upper[1]);
@@ -297,23 +357,30 @@ namespace vamp::collision
                     const auto syy = leaf_blocks[6][b].to_array();
                     const auto syz = leaf_blocks[7][b].to_array();
                     const auto szz = leaf_blocks[8][b].to_array();
-                    const auto al = leaf_blocks[9][b].to_array();
+                    const auto rad = leaf_blocks[9][b].to_array();
                     for (std::size_t l = 0; l < FVectorT::num_scalars; ++l)
                     {
-                        // Padding lanes carry a +inf mean / zero alpha ⇒ exact 0.
+                        // Padding lanes carry a +inf mean ⇒ p = 0 ⇒ factor 1.
                         const Gaussian3<FV> stored{
                             FV::fill(mx[l]),  FV::fill(my[l]),  FV::fill(mz[l]),
                             FV::fill(sxx[l]), FV::fill(sxy[l]), FV::fill(sxz[l]),
                             FV::fill(syy[l]), FV::fill(syz[l]), FV::fill(szz[l]),
-                            FV::fill(al[l])};
-                        acc = acc + gaussian_gaussian(query, stored);
+                            FV::fill(1.0F),   FV::fill(rad[l])};
+                        prod = prod * (FV::fill(1.0F) - gaussian_gaussian(query, stored));
+                    }
+                    // Reject early-out after each stored block: bail once every
+                    // lane is over budget instead of finishing this leaf.
+                    if (min_no_collision > 0.0F and
+                        prod.test_all_less_equal(FV::fill(min_no_collision)))
+                    {
+                        return;
                     }
                 }
                 return;
             }
 
-            descend_simd<rake>(nd.left, query, reach_sq, acc);
-            descend_simd<rake>(nd.right, query, reach_sq, acc);
+            descend_simd<rake>(nd.left, query, reach_sq, prod, min_no_collision);
+            descend_simd<rake>(nd.right, query, reach_sq, prod, min_no_collision);
         }
     };
 }  // namespace vamp::collision

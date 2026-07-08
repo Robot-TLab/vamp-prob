@@ -1,14 +1,38 @@
 #pragma once
 
-// ``gaussian_gaussian`` — the atomic probabilistic-collision primitive: the
-// Gaussian-product overlap of two 3-D Gaussians.  It is the probability-mass
-// analogue of ``sphere_sphere_sql2`` (``collision/sphere_sphere.hh``): a
-// robot-body sphere is itself a Gaussian (mean c_s, covariance
-// Σ_r^s = J Σ_q Jᵀ + r_s²·I — the FK-propagated position uncertainty with the
-// radius folded in), an obstacle is a Gaussian, and the per-pair risk is their
-// overlap.  The driver (``collision/risk_validity.hh``, fkcc-side) sums it over
-// obstacles; the SIMD/rake batching lives there, exactly as for the sphere
-// primitives.
+// The atomic probabilistic-collision primitive: the probability that two
+// UNCERTAIN SPHERES overlap.  A robot body sphere and an obstacle are each a
+// hard sphere (physical radius ``r``) whose CENTRE is Gaussian-uncertain
+// (mean ``μ``, position covariance ``Σ``).  They collide iff their centres come
+// within ``R = r_a + r_o`` of each other, and the centre gap
+// ``d = x_a − x_o`` is Gaussian with mean ``Δ = μ_a − μ_o`` and covariance
+// ``S = Σ_a + Σ_o``.  The per-pair collision probability is therefore the mass
+// of that gap distribution inside the ball of radius ``R``:
+//
+//     p = P(‖d‖ ≤ R),   d ~ N(Δ, S).
+//
+// This is a genuine probability in [0, 1] that SATURATES to 1 for a deep,
+// certain collision (Δ = 0, R ≫ √S) and decays to 0 far away — unlike the old
+// density-overlap kernel, whose value was an unbounded expected-overlap *mass*
+// scaled by a hand-tuned occupancy weight and never approached 1 in genuine
+// collision.  The physical extents ``r_a, r_o`` provide the saturation scale;
+// the uncertainties ``Σ_a, Σ_o`` only soften the boundary — so a single nearby
+// obstacle can carry the whole risk (no pile-up of dense samples needed).
+//
+// Isotropic projection.  A closed form for the ball integral exists only for an
+// isotropic gap covariance, so we project ``S`` onto its isotropic equivalent
+// ``s² = tr(S)/3`` — the same convention ``Gaussian3::iso_sigma`` /
+// ``visibility.hh`` already use.  With ``m = ‖Δ‖`` the exact 3-D result is
+//
+//     p = Φ((R−m)/s) + Φ((R+m)/s) − 1
+//         − (s/(m·√(2π)))·[ e^{−(R−m)²/2s²} − e^{−(R+m)²/2s²} ],
+//
+// where the last term is replaced by its finite ``m→0`` limit
+// ``√(2/π)·(R/s)·e^{−R²/2s²}`` near contact.  Written ``DataT``-generic so the
+// same routine serves a whole rake of lanes; the SIMD batching (FK, obstacle
+// iteration) lives in the caller, exactly as for the sphere primitives.  Only
+// the ``FloatVector`` instantiations are used (never scalar ``float``), so the
+// ``.max``/``.blend``/``.less_than`` lane ops below are always available.
 
 #include <vamp/collision/gaussian.hh>
 #include <vamp/collision/math.hh>
@@ -16,51 +40,61 @@
 
 namespace vamp::collision
 {
-    // Gaussian-product overlap of two 3-D Gaussians:
-    //
-    //   ⟨a, b⟩ = α_a · α_b · N(μ_a − μ_b; 0, Σ_a + Σ_b)
-    //
-    // Symmetric in the two Gaussians.  Written in ``DataT`` arithmetic so the
-    // *same* routine serves a scalar pair (``DataT = float``) or a whole rake of
-    // lanes (``DataT = FloatVector``); the batching — FK, obstacle iteration —
-    // lives in the caller, exactly as for the sphere primitives.  Σ_a + Σ_b ≻ 0
-    // for any risk input (each carries an r²·I / body-kernel term), so no
-    // determinant guard is needed.
+    // Floor on the isotropic gap std ``s`` (metres).  As ``s → 0`` the pair
+    // degrades to the deterministic hard-sphere test (p = 1 iff m ≤ R); the
+    // floor keeps the ``1/s`` terms finite with a ~0.1 mm soft boundary.
+    inline constexpr float kSphereSigmaFloor = 1e-4F;
+    inline constexpr float kSphereSigmaFloorSq = kSphereSigmaFloor * kSphereSigmaFloor;
+
+    // Probability that two uncertain spheres overlap (see file header).
     template <typename DataT>
     inline auto gaussian_gaussian(const Gaussian3<DataT> &a, const Gaussian3<DataT> &b) noexcept
         -> DataT
     {
-        // Σ_total = Σ_a + Σ_b.
-        const DataT txx = a.sigma_xx + b.sigma_xx;
-        const DataT txy = a.sigma_xy + b.sigma_xy;
-        const DataT txz = a.sigma_xz + b.sigma_xz;
-        const DataT tyy = a.sigma_yy + b.sigma_yy;
-        const DataT tyz = a.sigma_yz + b.sigma_yz;
-        const DataT tzz = a.sigma_zz + b.sigma_zz;
+        constexpr float INV_SQRT_2PI = 0.3989422804014327F;  // 1 / √(2π)
 
-        // μ_diff = μ_a − μ_b.
+        // Centre gap Δ = μ_a − μ_b and its magnitude m = ‖Δ‖.  The +ε under the
+        // root keeps the rsqrt-based ``sqrt`` off exact zero (it returns NaN at
+        // 0); at coincident centres m ≈ 1e-6, which correctly trips the m→0
+        // contact branch below.
         const DataT dx = a.mx - b.mx;
         const DataT dy = a.my - b.my;
         const DataT dz = a.mz - b.mz;
+        const DataT m = sqrt((dx * dx + dy * dy + dz * dz) + DataT::fill(1e-12F));
 
-        // Symmetric 3×3 cofactors (matches the scalar ``sym3_solve``).
-        const DataT c00 = tyy * tzz - tyz * tyz;
-        const DataT c01 = txz * tyz - txy * tzz;
-        const DataT c02 = txy * tyz - txz * tyy;
-        const DataT c11 = txx * tzz - txz * txz;
-        const DataT c12 = txz * txy - txx * tyz;
-        const DataT c22 = txx * tyy - txy * txy;
+        // Isotropic combined position spread s² = tr(Σ_a + Σ_b)/3, floored so
+        // the pair never divides by zero (hard-sphere limit).
+        const DataT tr =
+            (a.sigma_xx + b.sigma_xx) + (a.sigma_yy + b.sigma_yy) + (a.sigma_zz + b.sigma_zz);
+        const DataT s_sq = (tr * (1.0F / 3.0F)).max(DataT::fill(kSphereSigmaFloorSq));
+        const DataT s = sqrt(s_sq);
+        const DataT inv_s = rcp(s);
 
-        const DataT det = txx * c00 + txy * c01 + txz * c02;
-        const DataT inv_det = rcp(det);
+        // Minkowski radius R = r_a + r_o and the two normalised offsets.
+        const DataT R = a.radius + b.radius;
+        const DataT u = (R - m) * inv_s;  // (R − m)/s
+        const DataT v = (R + m) * inv_s;  // (R + m)/s
 
-        const DataT solx = (c00 * dx + c01 * dy + c02 * dz) * inv_det;
-        const DataT soly = (c01 * dx + c11 * dy + c12 * dz) * inv_det;
-        const DataT solz = (c02 * dx + c12 * dy + c22 * dz) * inv_det;
-        const DataT quad = dx * solx + dy * soly + dz * solz;
+        // Φ((R−m)/s) + Φ((R+m)/s) − 1.
+        const DataT main = (normal_cdf(u) + normal_cdf(v)) - DataT::fill(1.0F);
 
-        constexpr float TWO_PI_POW_3_2 = 15.749609945722419F;  // (2π)^{3/2}
-        const DataT norm = rcp(sqrt(det)) * (1.0F / TWO_PI_POW_3_2);
-        return a.alpha * b.alpha * (norm * exp(quad * -0.5F));
+        // Gaussian factors e^{−½u²} = e^{−(R−m)²/2s²}, likewise for v.
+        const DataT eu = exp(u * u * -0.5F);
+        const DataT ev = exp(v * v * -0.5F);
+
+        // Correction term (s/(m√(2π)))·(eu − ev); near m→0 it tends to
+        // √(2/π)·(R/s)·e^{−R²/2s²} = 2·(R/s)·e^{−½(R/s)²}/√(2π).
+        const DataT m_div = m.max(DataT::fill(1e-9F));  // guard the unused-lane 1/m
+        const DataT tail_far = (s * rcp(m_div)) * (eu - ev) * INV_SQRT_2PI;
+        const DataT ros = R * inv_s;
+        const DataT tail_near = (ros * exp(ros * ros * -0.5F)) * (2.0F * INV_SQRT_2PI);
+        // Blend to the m→0 limit where m is tiny relative to s (contact).
+        const DataT tail = tail_far.blend(tail_near, m.less_than(s * 1e-2F));
+
+        // Clamp to [0, 1]: removes fp noise so (1 − p) is a well-formed product
+        // factor, AND sanitises the tree's padding lanes — a +inf mean gives
+        // sqrt(inf)=NaN → NaN here, and clamp(NaN, 0, 1) = 0 (max/min return the
+        // non-NaN operand), i.e. a padding obstacle contributes p = 0 (factor 1).
+        return (main - tail).clamp(0.0F, 1.0F);
     }
 }  // namespace vamp::collision

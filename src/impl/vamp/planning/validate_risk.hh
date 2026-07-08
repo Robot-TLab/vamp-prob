@@ -74,6 +74,19 @@ namespace vamp::planning
         return out;
     }
 
+    // Convert a per-waypoint reject threshold (a collision-probability budget) to
+    // the no-collision floor consumed by the noisy-OR reject early-out.  A value
+    // outside (0, 1) disables the early-out (floor 0 → full, exact evaluation).
+    // For the feasibility verdict to stay exact, pass ``risk_early_out ≥ eps``:
+    // the early-out then stops a waypoint only once its P is provably at/over the
+    // budget, so an early-terminated lane reports P ≥ risk_early_out ≥ eps and is
+    // still rejected by the caller's ``P > eps`` gate.
+    inline constexpr auto risk_no_collision_floor(float risk_early_out) noexcept -> float
+    {
+        return (risk_early_out > 0.0F and risk_early_out < 1.0F) ? (1.0F - risk_early_out)
+                                                                 : 0.0F;
+    }
+
     // Per-rake-block risk: evaluate the per-waypoint risk for every
     // lane in ``block`` and return a ``rake``-element vector.  Internal
     // helper used by both ``validate_motion_risk`` and
@@ -82,32 +95,50 @@ namespace vamp::planning
     inline auto evaluate_risk(
         const typename Robot::template ConfigurationBlock<rake> &block,
         const collision::Environment<float> &env,
-        const FloatVector<rake, Robot::n_sigma_q> &sigma_q_block) noexcept -> std::array<float, rake>
+        const FloatVector<rake, Robot::n_sigma_q> &sigma_q_block,
+        float min_no_collision = 0.0F) noexcept -> std::array<float, rake>
     {
         typename Robot::template SpheresWithCov<rake> spheres;
         Robot::template sphere_fk_with_cov<rake>(block, sigma_q_block, spheres);
 
         // Keep the rake packed.  Each sphere row is a ``FloatVector<rake>``
-        // (the ``rake`` configurations of that sphere), so the robot body
-        // is a ``Gaussian3<FloatVector<rake>>`` and every obstacle is
-        // evaluated against all rake lanes in one SIMD step — the same
-        // robot-vs-environment SIMD the deterministic
-        // ``sphere_environment_in_collision`` uses.  Σ_r^s already has
-        // r_s²·I folded in by the FK codegen.
+        // (the ``rake`` configurations of that sphere), so the robot body is a
+        // ``Gaussian3<FloatVector<rake>>`` and every obstacle is evaluated
+        // against all rake lanes in one SIMD step.  The collision probability is
+        // a noisy-OR across every body sphere AND every obstacle:
+        // P = 1 − ∏(1 − p).
+        //
+        // Each body sphere is an UNCERTAIN SPHERE: the FK codegen folds r_s²·I
+        // into the covariance diagonal, so recover the PURE position covariance
+        // by subtracting r_s² and carry ``spheres.r[s]`` as the hard radius —
+        // kept out of Σ so the physical extent isn't double-counted (it provides
+        // the collision saturation scale; Σ only softens the boundary).
         using FV = FloatVector<rake>;
-        FV risk_acc = FV::fill(0.0F);
+        FV no_collision = FV::fill(1.0F);
         const FV one = FV::fill(1.0F);
         for (std::size_t s = 0; s < Robot::n_spheres; ++s)
         {
+            const FV r = spheres.r[s];
+            const FV r_sq = r * r;
             const collision::Gaussian3<FV> robot{
-                spheres.x[s],        spheres.y[s],        spheres.z[s],
-                spheres.sigma_xx[s], spheres.sigma_xy[s], spheres.sigma_xz[s],
-                spheres.sigma_yy[s], spheres.sigma_yz[s], spheres.sigma_zz[s],
-                one};
-            risk_acc = risk_acc + sphere_environment_risk<FV>(env, robot);
+                spheres.x[s],               spheres.y[s],        spheres.z[s],
+                spheres.sigma_xx[s] - r_sq, spheres.sigma_xy[s], spheres.sigma_xz[s],
+                spheres.sigma_yy[s] - r_sq, spheres.sigma_yz[s], spheres.sigma_zz[s] - r_sq,
+                one,                        r};
+            no_collision = no_collision *
+                           sphere_environment_no_collision<FV>(env, robot, min_no_collision);
+            // Reject early-out across the body spheres: once every lane's
+            // accumulated no-collision product is at/under the floor, every
+            // lane's P is already over budget — the remaining body spheres can
+            // only lower it further, so stop (like the deterministic first-hit).
+            if (min_no_collision > 0.0F and
+                no_collision.test_all_less_equal(FV::fill(min_no_collision)))
+            {
+                break;
+            }
         }
 
-        return risk_acc.to_array();
+        return (one - no_collision).to_array();
     }
 
     // Per-configuration risk: probabilistic counterpart to single-state
@@ -116,7 +147,8 @@ namespace vamp::planning
     inline auto validate_config_risk(
         const typename Robot::Configuration &q,
         const collision::Environment<float> &env,
-        const collision::Sym3 &sigma_q) noexcept -> float
+        const collision::Sym3 &sigma_q,
+        float risk_early_out = 1.0F) noexcept -> float
     {
         // Build a rake block with every lane = q (cheap; only one lane
         // is actually distinct in the result, the others are wasted
@@ -129,7 +161,8 @@ namespace vamp::planning
         }
 
         const auto sigma_q_block = broadcast_sigma_q<rake, Robot::n_sigma_q>(sigma_q);
-        const auto risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
+        const auto risks = evaluate_risk<Robot, rake>(
+            block, env, sigma_q_block, risk_no_collision_floor(risk_early_out));
         return risks[0];
     }
 
@@ -147,8 +180,17 @@ namespace vamp::planning
         const typename Robot::Configuration &goal,
         const collision::Environment<float> &env,
         const collision::Sym3 &sigma_q,
-        float eps_per_waypoint = std::numeric_limits<float>::infinity()) -> EdgeRiskResult
+        float eps_per_waypoint = std::numeric_limits<float>::infinity(),
+        float risk_early_out = 1.0F) -> EdgeRiskResult
     {
+        // Noisy-OR reject early-out floor.  Passing ``risk_early_out ==
+        // eps_per_waypoint`` recovers VAMP's deterministic first-hit behaviour:
+        // a waypoint stops accumulating the moment its P crosses the budget.  The
+        // block-level ``P > eps`` gate below is unchanged, so the feasibility
+        // verdict is identical (only a rejected waypoint's reported P becomes a
+        // lower bound ≥ risk_early_out).  ``1.0`` (or any value ≥ 1) disables it.
+        const float min_no_collision = risk_no_collision_floor(risk_early_out);
+
         const auto vector = goal - start;
         const float distance = vector.l2_norm();
 
@@ -158,10 +200,11 @@ namespace vamp::planning
         // Contiguous waypoint layout: block ``i`` carries the ``rake`` *adjacent*
         // waypoints at fractions (i·rake + l + 1)/(rake·n).  Packing spatially
         // close waypoints into one rake lets the GaussianTree descend a whole
-        // block in a single packet walk (``GaussianTree::sum_overlap``), keeping
-        // the risk sum SIMD with no per-lane unpack.  The deterministic validator
-        // spreads the rake across the edge so it can early-exit anywhere; the
-        // risk sum never early-exits within an edge, so it packs tightly.  The
+        // block in a single packet walk (``GaussianTree::no_collision_product``),
+        // keeping the risk SIMD with no per-lane unpack.  The deterministic
+        // validator spreads the rake across the edge so it can early-exit
+        // anywhere; the risk product never early-exits within an edge, so it
+        // packs tightly.  The
         // evaluated waypoint *set* {k/(rake·n) : k=1..rake·n} is identical to the
         // spread layout — only the lane grouping changes.
         std::array<float, rake> base_p{};
@@ -184,7 +227,8 @@ namespace vamp::planning
         result.per_waypoint_risk.reserve(rake * n);
 
         // First rake-block (the K end-points of the substep sweep).
-        auto risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
+        auto risks =
+            evaluate_risk<Robot, rake>(block, env, sigma_q_block, min_no_collision);
         for (auto lane = 0U; lane < rake; ++lane)
         {
             result.per_waypoint_risk.push_back(risks[lane]);
@@ -206,7 +250,7 @@ namespace vamp::planning
             {
                 block[j] = block[j] + forward.broadcast(j);
             }
-            risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block);
+            risks = evaluate_risk<Robot, rake>(block, env, sigma_q_block, min_no_collision);
             for (auto lane = 0U; lane < rake; ++lane)
             {
                 result.per_waypoint_risk.push_back(risks[lane]);

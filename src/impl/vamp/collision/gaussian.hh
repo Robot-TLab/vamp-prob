@@ -67,7 +67,18 @@ namespace vamp::collision
         DataT sigma_yz;
         DataT sigma_zz;
 
+        // ``alpha`` — per-kernel scalar weight, used by the visibility
+        // primitives (``observation_reward`` / ``optimal_gaze``).
         DataT alpha;
+
+        // ``radius`` — the *physical* extent of the body this Gaussian
+        // stands for (a robot body sphere or an obstacle), kept SEPARATE
+        // from the position covariance.  The probabilistic collision
+        // primitive (``gaussian_gaussian.hh``) treats the pair as two
+        // uncertain spheres and tests overlap of their hard radii
+        // ``r_a + r_o`` under the combined position spread ``Σ_a + Σ_o``.
+        // The visibility path leaves this at 0 (kernels are point masses).
+        DataT radius;
 
         Gaussian3()
           : mx()
@@ -80,6 +91,7 @@ namespace vamp::collision
           , sigma_yz()
           , sigma_zz()
           , alpha(static_cast<DataT>(1))
+          , radius(static_cast<DataT>(0))
         {
         }
 
@@ -93,7 +105,8 @@ namespace vamp::collision
             DataT sigma_yy,
             DataT sigma_yz,
             DataT sigma_zz,
-            DataT alpha = static_cast<DataT>(1))
+            DataT alpha = static_cast<DataT>(1),
+            DataT radius = static_cast<DataT>(0))
           : mx(mx)
           , my(my)
           , mz(mz)
@@ -104,6 +117,7 @@ namespace vamp::collision
           , sigma_yz(sigma_yz)
           , sigma_zz(sigma_zz)
           , alpha(alpha)
+          , radius(radius)
         {
         }
 
@@ -119,6 +133,7 @@ namespace vamp::collision
           , sigma_yz(other.sigma_yz)
           , sigma_zz(other.sigma_zz)
           , alpha(other.alpha)
+          , radius(other.radius)
         {
         }
 
